@@ -1,0 +1,176 @@
+#pragma once
+
+#include <Eigen/Dense>
+
+enum class BoardType
+{
+    RECT = 0,
+    HEX = 1,
+};
+class Board
+{
+   public:
+    BoardType type_;
+
+    int cols_;
+    int rows_;
+
+    float inner_radius_;
+    float outer_radius_;
+
+    float spacing_cols_;
+    float spacing_rows_;
+
+    std::vector<Eigen::Vector3d> marker_centers_;
+
+    Eigen::Vector3d top_left_;
+    Eigen::Vector3d bottom_right_;
+
+    virtual ~Board() = default;
+    Eigen::Vector2i id_to_row_and_col(const int id) const;
+    int row_and_col_to_id(const int row, const int col) const;
+    void apply_scale(const float factor);
+};
+
+/**
+ * @brief Define calibration board base on concentric circles.
+ *
+ * 0 1 2 are big black markers, and N is called "non-unique" (becaus it's ring marker) but it forms with unique markers
+ * quad in board domain.
+ *
+ *  board in ordering of
+ *  ------------>
+ * | * * * * * *
+ * | * 0 * * N *
+ * | * * * * * *
+ * | * 1 * * 2 *
+ * V * * * * * *
+ *
+ * board indexing
+ * ------------>
+ * | 0  1  2 * * 29
+ * | 30 31 * * * *
+ * | * * * * * * *
+ * | * * * * * * *
+ * V * * * * * * *
+ *
+ */
+class BoardRectGrid : public Board
+{
+   public:
+    const int row_top_ = 4;
+    const int col_top_ = 4;
+
+    const int row_down_ = 12;
+    const int col_down_ = 4;
+
+    const int row_right_ = 12;
+    const int col_right_ = 18;
+
+    const int row_non_unique_ = 4;
+    const int col_non_unique_ = 18;
+
+    const float edge_average_difference_allowed_ = 0.5f;
+
+    int marker_distance_01() const;
+    int marker_distance_12() const;
+
+    // return row/col locations of line between X-Y coding locations (exclude coding markers)
+    std::vector<std::pair<int, int>> marker_lines_01_locations() const;
+    std::vector<std::pair<int, int>> marker_lines_12_locations() const;
+
+    BoardRectGrid();
+};
+
+/**
+ * @brief Define calibration board base on concentric circles.
+ *
+ * 0 1 are invisible markers
+ *
+ *  board in ordering of
+ *  ------------>
+ * | * * * * * *
+ * |  * * * * * *
+ * | * * * * * *
+ * |  * 0 * 1 * *
+ * | * * * * * *
+ * V  * * * * * *
+ *
+ * board indexing
+ * ------------>
+ * | 000 001 002  *   *   028
+ * |   029 030  *   *   *    *
+ * |  *   *   *   *   *    *
+ * |    *   *   *   *   *    *
+ * V  *   *   *   *   *    *
+ *
+ * The single marker of the board:
+ * |__________________10mm___________________|
+ * |       |___________5mm___________|       |
+ * |       |                         |       |
+ * |       |      ooooooooooooo      |       |
+ * |       |  ooooooooooooooooooooo  |       |
+ * |       |ooooooooooooooooooooooooo|       |
+ * |     oo|ooooooooooooooooooooooooo|oo     |
+ * |   oooo|ooooooo           ooooooo|oooo   |
+ * |  ooooo|oooo                 oooo|oooo#  |
+ * | oooooo|oo                     oo|oooooo |
+ * |ooooooo|o                       o|ooooooo|
+ * |ooooooo|                         |ooooooo|
+ * |ooooooo|                         |ooooooo|
+ * |ooooooo|                         |ooooooo|
+ * ooooooooo                         ooooooooo
+ *  oooooooo                         oooooooo
+ *  ooooooooo                       ooooooooo
+ *   ooooooooo                     ooooooooo
+ *    oooooooooo                 oooooooooo
+ *     oooooooooooo           oooooooooooo
+ *       ooooooooooooooooooooooooooooooo
+ *         ooooooooooooooooooooooooooo
+ *            ooooooooooooooooooooo
+ *                ooooooooooooo
+ */
+class BoardHexGrid : public Board
+{
+   public:
+    struct Params
+    {
+        int rows = 29;
+        int cols = 35;
+        int row_left = 14;
+        int col_left = 15;
+        int row_right = 14;
+        int col_right = 17;
+    };
+
+    int row_left_;
+    int col_left_;
+    int row_right_;
+    int col_right_;
+
+    /**
+     *  Even:
+     * | * * * * * *
+     * |  * L * R * *
+     * | * * * * * *
+     * |  * * * * * *
+     *  Odd:
+     * |  * * * * * *
+     * | * L * R * *
+     * |  * * * * * *
+     * | * * * * * *
+     */
+    const bool is_even_ = true;
+
+    int marker_distance_01() const;
+
+    // return row/col locations of line between X-Y coding locations (exclude coding markers)
+    std::vector<std::pair<int, int>> marker_lines_01_locations() const;
+
+    BoardHexGrid();
+    BoardHexGrid(const Params& params);
+
+   private:
+    void init_default();
+    void setup_markers();
+};

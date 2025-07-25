@@ -1,0 +1,8 @@
+FIND_PACKAGE(OpenMP)
+if(OPENMP_FOUND)
+    message(STATUS "OpenMP found")
+    add_compile_options(${OpenMP_CXX_FLAGS})
+    add_link_options(${OpenMP_CXX_FLAGS})
+else()
+    message(STATUS "OpenMP not found")
+endif()
