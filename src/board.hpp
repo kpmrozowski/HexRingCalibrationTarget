@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Eigen/Dense>
+#include <memory>
 
 enum class BoardType
 {
@@ -30,6 +31,8 @@ class Board
     Eigen::Vector2i id_to_row_and_col(const int id) const;
     int row_and_col_to_id(const int row, const int col) const;
     void apply_scale(const float factor);
+
+    virtual std::string_view name() { return "dummy"; }
 };
 
 /**
@@ -72,6 +75,8 @@ class BoardRectGrid : public Board
 
     const float edge_average_difference_allowed_ = 0.5f;
 
+    BoardRectGrid();
+
     int marker_distance_01() const;
     int marker_distance_12() const;
 
@@ -79,7 +84,7 @@ class BoardRectGrid : public Board
     std::vector<std::pair<int, int>> marker_lines_01_locations() const;
     std::vector<std::pair<int, int>> marker_lines_12_locations() const;
 
-    BoardRectGrid();
+    std::string_view name() override { return "RectRingCalibTarget"; }
 };
 
 /**
@@ -162,15 +167,26 @@ class BoardHexGrid : public Board
      */
     const bool is_even_ = true;
 
+    BoardHexGrid();
+    BoardHexGrid(const Params& params);
+
     int marker_distance_01() const;
 
     // return row/col locations of line between X-Y coding locations (exclude coding markers)
     std::vector<std::pair<int, int>> marker_lines_01_locations() const;
 
-    BoardHexGrid();
-    BoardHexGrid(const Params& params);
+    std::string_view name() override { return "HexRingCalibTarget"; }
 
    private:
     void init_default();
     void setup_markers();
 };
+
+namespace board
+{
+
+BoardHexGrid::Params get_hex_params(const std::vector<int>& board_params);
+
+std::unique_ptr<Board> get_board(const int board_type, const std::vector<int>& board_params);
+
+};  // namespace board

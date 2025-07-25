@@ -46,8 +46,8 @@ CLI::Option* Subcommand::add_board(CLI::App& cmd, int& board_type)
 CLI::Option* Subcommand::add_board_params(CLI::App& cmd, std::vector<int>& board_params)
 {
     return cmd.add_option("-p, --board-params", board_params,
-                          "Params for HexGrid: [rows, cols, row_left, col_left, row_right, col_right], "
-                          "Params for RectGrid: unavailable");
+                          "Params for HexRingCalibTarget: [rows, cols, row_left, col_left, row_right, col_right], "
+                          "Params for RectRingCalibTarget: unavailable");
 }
 
 }  // namespace utils

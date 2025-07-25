@@ -166,3 +166,37 @@ void BoardHexGrid::setup_markers()
         }
     }
 }
+
+BoardHexGrid::Params board::get_hex_params(const std::vector<int>& board_params)
+{
+    BoardHexGrid::Params params;
+    switch (board_params.size())
+    {
+        case 6:
+            params.col_right = board_params.at(5);
+        case 5:
+            params.row_right = board_params.at(4);
+        case 4:
+            params.col_left = board_params.at(3);
+        case 3:
+            params.row_left = board_params.at(2);
+        case 2:
+            params.cols = board_params.at(1);
+        case 1:
+            params.rows = board_params.at(0);
+    }
+
+    return params;
+}
+
+std::unique_ptr<Board> board::get_board(const int board_type, const std::vector<int>& board_params)
+{
+    std::unique_ptr<Board> calibration_board;
+    switch ((BoardType)board_type)
+    {
+        case BoardType::RECT:
+            return std::make_unique<BoardRectGrid>();
+        case BoardType::HEX:
+            return std::make_unique<BoardHexGrid>(get_hex_params(board_params));
+    }
+}

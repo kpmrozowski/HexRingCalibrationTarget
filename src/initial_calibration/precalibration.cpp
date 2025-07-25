@@ -128,7 +128,6 @@ precalibration::PinholeCalibration calculate(const OpenCVWrapper &wrapper)
                                              wrapper.sensor_size_for_calibration_init_, camera, distortions, rotations,
                                              translations, 0, cv::TermCriteria(cv::TermCriteria::COUNT, 100, 0.0));
 
-
     const auto board_positions = concentrate_transformations(rotations, translations, wrapper.vector_to_image_id_);
 
     auto calibration_pinhole = get_calibration(camera, distortions);
