@@ -2,6 +2,7 @@
 
 #include <Eigen/Dense>
 #include <memory>
+#include <variant>
 
 enum class BoardType
 {
@@ -16,16 +17,16 @@ class Board
     int cols_;
     int rows_;
 
-    float inner_radius_;
-    float outer_radius_;
+    float inner_radius_;  // [mm]
+    float outer_radius_;  // [mm]
 
-    float spacing_cols_;
-    float spacing_rows_;
+    float spacing_cols_;  // [mm]
+    float spacing_rows_;  // [mm]
 
     std::vector<Eigen::Vector3d> marker_centers_;
 
-    Eigen::Vector3d top_left_;
-    Eigen::Vector3d bottom_right_;
+    Eigen::Vector3d top_left_;      // [mm]
+    Eigen::Vector3d bottom_right_;  // [mm]
 
     virtual ~Board() = default;
     Eigen::Vector2i id_to_row_and_col(const int id) const;
@@ -146,6 +147,10 @@ class BoardHexGrid : public Board
         int col_left = 15;
         int row_right = 14;
         int col_right = 17;
+        float spacing_cols = 11.6f;  // [mm]
+        float inner_radius = 2.4f;   // [mm]
+        float outer_radius = 4.8f;   // [mm]
+        bool is_even = true;
     };
 
     int row_left_;
@@ -165,7 +170,7 @@ class BoardHexGrid : public Board
      * |  * * * * * *
      * | * * * * * *
      */
-    const bool is_even_ = true;
+    bool is_even_;
 
     BoardHexGrid();
     BoardHexGrid(const Params& params);
@@ -178,15 +183,15 @@ class BoardHexGrid : public Board
     std::string_view name() override { return "HexRingCalibTarget"; }
 
    private:
-    void init_default();
+    void init_params(const Params& params);
     void setup_markers();
 };
 
 namespace board
 {
 
-BoardHexGrid::Params get_hex_params(const std::vector<int>& board_params);
+BoardHexGrid::Params get_hex_params(const std::vector<std::variant<int, float>>& board_params);
 
-std::unique_ptr<Board> get_board(const int board_type, const std::vector<int>& board_params);
+std::unique_ptr<Board> get_board(const int board_type, const std::vector<std::variant<int, float>>& board_params);
 
 };  // namespace board

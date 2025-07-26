@@ -9,7 +9,7 @@ class CalibrateMono : public utils::Subcommand
     std::filesystem::path dataset_folder_;
     std::filesystem::path output_folder_;
     std::string camera_id_;
-    std::vector<int> board_params_;
+    std::vector<std::variant<int, float>> board_params_;
     int board_type_ = 0;
 
    public:

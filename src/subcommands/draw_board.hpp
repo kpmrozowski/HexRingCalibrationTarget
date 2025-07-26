@@ -7,7 +7,7 @@ class DrawBoard : public utils::Subcommand
    private:
     int board_type_;
 
-    std::vector<int> board_params_;
+    std::vector<std::variant<int, float>> board_params_;
     int resolution_;
     int dpi_;
 

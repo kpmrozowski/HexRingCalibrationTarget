@@ -24,12 +24,12 @@ std::pair<int, bool> accurate_intensity(const float row_center, const float col_
 /**
  * @brief Function allow to accurately draw image of calibration board.
  */
-cv::Mat1b draw_canonical_board(const BoardRectGrid &board, const float cm_per_pixel);
+cv::Mat1b draw_canonical_board(const BoardRectGrid &board, const float mm_per_pixel);
 
 /**
  * @brief Function allow to accurately draw image of calibration board.
  */
-cv::Mat1b draw_canonical_board(const BoardHexGrid &board, const float cm_per_pixel,
-                               const cv::Size_<float> board_dimention_mm);
+cv::Mat1b draw_canonical_board(const BoardHexGrid &board, const float mm_per_pixel,
+                               const cv::Size_<float> board_dimension_mm);
 
 }  // namespace board

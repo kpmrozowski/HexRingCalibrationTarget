@@ -1,4 +1,5 @@
 #include "board.hpp"
+#include <variant>
 
 namespace
 {
@@ -84,10 +85,10 @@ BoardRectGrid::BoardRectGrid()
     type_ = BoardType::RECT;
     rows_ = 17;
     cols_ = 23;
-    inner_radius_ = 0.25f;
-    outer_radius_ = 0.5f;
-    spacing_rows_ = 1.6217f;
-    spacing_cols_ = 1.6217f;
+    inner_radius_ = 2.5f;     // [mm]
+    outer_radius_ = 5.f;      // [mm]
+    spacing_rows_ = 16.217f;  // [mm]
+    spacing_cols_ = 16.217f;  // [mm]
     top_left_ = Eigen::Vector3d(spacing_cols_ + outer_radius_, spacing_rows_ + outer_radius_, 0);
     bottom_right_ = Eigen::Vector3d((cols_ + 1.0) * spacing_cols_ + outer_radius_,
                                     (rows_ + 1.0) * spacing_rows_ + outer_radius_, 0.0);
@@ -117,47 +118,40 @@ std::vector<std::pair<int, int>> BoardHexGrid::marker_lines_01_locations() const
 
 BoardHexGrid::BoardHexGrid()
 {
-    init_default();
+    init_params(Params{});
     setup_markers();
 }
 
 BoardHexGrid::BoardHexGrid(const Params& params)
 {
-    init_default();
+    init_params(params);
+    setup_markers();
+}
 
+void BoardHexGrid::init_params(const Params& params)
+{
+    type_ = BoardType::HEX;
     rows_ = params.rows;
     cols_ = params.cols;
     row_left_ = params.row_left;
     col_left_ = params.col_left;
     row_right_ = params.row_right;
     col_right_ = params.col_right;
-
-    setup_markers();
+    spacing_cols_ = params.spacing_cols;
+    inner_radius_ = params.inner_radius;
+    outer_radius_ = params.outer_radius;
+    is_even_ = params.is_even;
 }
 
-void BoardHexGrid::init_default()
+void BoardHexGrid::setup_markers()
 {
     static constexpr float kEquilateralTriangleHeight = std::numbers::sqrt3_v<float> / 2.f;
-    type_ = BoardType::HEX;
-    Params default_params;
-    rows_ = default_params.rows;
-    cols_ = default_params.cols;
-    inner_radius_ = 0.24f;
-    outer_radius_ = 0.48f;
-    spacing_cols_ = 1.16f;
+
     spacing_rows_ = kEquilateralTriangleHeight * spacing_cols_;
     top_left_ = 2. * Eigen::Vector3d(outer_radius_, outer_radius_, 0);
     bottom_right_ =
         Eigen::Vector3d((cols_ + 0.5) * spacing_cols_ + outer_radius_, rows_ * spacing_rows_ + outer_radius_, 0.0);
 
-    row_left_ = default_params.row_left;
-    col_left_ = default_params.col_left;
-    row_right_ = default_params.row_right;
-    col_right_ = default_params.col_right;
-}
-
-void BoardHexGrid::setup_markers()
-{
     for (int row = 0; row < rows_; ++row)
     {
         for (int col = 0; col < cols_; ++col)
@@ -167,29 +161,37 @@ void BoardHexGrid::setup_markers()
     }
 }
 
-BoardHexGrid::Params board::get_hex_params(const std::vector<int>& board_params)
+BoardHexGrid::Params board::get_hex_params(const std::vector<std::variant<int, float>>& board_params)
 {
     BoardHexGrid::Params params;
     switch (board_params.size())
     {
+        case 10:
+            params.is_even = std::get<int>(board_params.at(9)) != 0;
+        case 9:
+            params.outer_radius = std::get<float>(board_params.at(8));
+        case 8:
+            params.inner_radius = std::get<float>(board_params.at(7));
+        case 7:
+            params.spacing_cols = std::get<float>(board_params.at(6));
         case 6:
-            params.col_right = board_params.at(5);
+            params.col_right = std::get<int>(board_params.at(5));
         case 5:
-            params.row_right = board_params.at(4);
+            params.row_right = std::get<int>(board_params.at(4));
         case 4:
-            params.col_left = board_params.at(3);
+            params.col_left = std::get<int>(board_params.at(3));
         case 3:
-            params.row_left = board_params.at(2);
+            params.row_left = std::get<int>(board_params.at(2));
         case 2:
-            params.cols = board_params.at(1);
+            params.cols = std::get<int>(board_params.at(1));
         case 1:
-            params.rows = board_params.at(0);
+            params.rows = std::get<int>(board_params.at(0));
     }
 
     return params;
 }
 
-std::unique_ptr<Board> board::get_board(const int board_type, const std::vector<int>& board_params)
+std::unique_ptr<Board> board::get_board(const int board_type, const std::vector<std::variant<int, float>>& board_params)
 {
     std::unique_ptr<Board> calibration_board;
     switch ((BoardType)board_type)

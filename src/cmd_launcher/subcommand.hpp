@@ -4,6 +4,7 @@
 #include <string>
 
 #include <CLI/CLI.hpp>
+#include <variant>
 
 namespace utils
 {
@@ -20,7 +21,7 @@ class Subcommand
     CLI::Option* add_path_to_save(CLI::App& cmd, std::filesystem::path& output_folder);
     CLI::Option* add_camera(CLI::App& cmd, std::string& camera_id);
     CLI::Option* add_board(CLI::App& cmd, int& board_type);
-    CLI::Option* add_board_params(CLI::App& cmd, std::vector<int>& board_params);
+    CLI::Option* add_board_params(CLI::App& cmd, std::vector<std::variant<int, float>>& board_params);
 
    public:
     CLI::App& set_subcommand(CLI::App& app);
