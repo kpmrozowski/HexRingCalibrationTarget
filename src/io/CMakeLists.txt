@@ -3,6 +3,7 @@ set(LIB_NAME ${PROJECT_NAME}_${MODULE_NAME})
 set(EXPORT_LIB_NAME ${PROJECT_NAME}::${MODULE_NAME})
 
 set(LIB_SRCS
+    board_params_io.cpp
     debug.cpp
     images_set.cpp
     save_path.cpp

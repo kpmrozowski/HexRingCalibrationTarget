@@ -19,9 +19,9 @@ namespace
 cv::Mat1b binarize(cv::Mat1b &input, const marker::DetectionParameters &parameters)
 {
     auto thresholds = thresholds::thresholds(input, parameters.row_tiles_count_, parameters.col_tiles_count_);
-    for (auto &tresh : thresholds.thresholds_)
+    for (auto &thresh : thresholds.thresholds_)
     {
-        tresh = std::max(tresh, parameters.minimal_treshold_);
+        thresh = std::max(thresh, parameters.minimal_threshold_);
     }
 
     return thresholds::binarize(input, thresholds);
@@ -69,7 +69,7 @@ std::vector<base::MarkerUnidentified> filter_as_objects_simple_descriptors_cores
 
         const int longest = std::max(stats(object_idx, cv::CC_STAT_HEIGHT), stats(object_idx, cv::CC_STAT_WIDTH));
 
-        if (longest > parameters.maximal_edge_lenght_core_)
+        if (longest > parameters.maximal_edge_length_core_)
         {
             continue;
         }
@@ -142,7 +142,7 @@ std::vector<base::MarkerUnidentified> filter_as_objects_simple_descriptors_rings
 
         const int longest = std::max(stats(object_idx, cv::CC_STAT_HEIGHT), stats(object_idx, cv::CC_STAT_WIDTH));
 
-        if (longest > parameters.maximal_edge_lenght_ring_)
+        if (longest > parameters.maximal_edge_length_ring_)
         {
             continue;
         }
@@ -157,8 +157,8 @@ std::vector<base::MarkerUnidentified> filter_as_objects_simple_descriptors_rings
 
         const auto type = marker::symetries::test_intensities_values_and_symmetries_rings(
             input, centroid(object_idx, 1), centroid(object_idx, 0),
-            stats(object_idx, cv::CC_STAT_WIDTH) * parameters.reduction_in_edge_lenght_ring_,
-            stats(object_idx, cv::CC_STAT_HEIGHT) * parameters.reduction_in_edge_lenght_ring_,
+            stats(object_idx, cv::CC_STAT_WIDTH) * parameters.reduction_in_edge_length_ring_,
+            stats(object_idx, cv::CC_STAT_HEIGHT) * parameters.reduction_in_edge_length_ring_,
             parameters.min_difference_scale_);
 
         switch (type)

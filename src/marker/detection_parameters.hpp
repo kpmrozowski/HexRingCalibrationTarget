@@ -9,17 +9,17 @@ struct DetectionParameters
     const int row_tiles_count_ = 4 * 2;
     const int col_tiles_count_ = 7 * 2;
 
-    const int minimal_treshold_ = 40;
+    const int minimal_threshold_ = 40;
 
     int minimal_pixel_count_core_ = 0;
-    int maximal_edge_lenght_core_ = 12;
-    int maximal_pixel_count_core_ = maximal_edge_lenght_core_ * maximal_edge_lenght_core_;
+    int maximal_edge_length_core_ = 12;
+    int maximal_pixel_count_core_ = maximal_edge_length_core_ * maximal_edge_length_core_;
 
-    int minimal_pixel_count_ring_ = maximal_edge_lenght_core_ * maximal_edge_lenght_core_;
-    int maximal_edge_lenght_ring_ = maximal_edge_lenght_core_ * 3;
-    int maximal_pixel_count_ring_ = maximal_edge_lenght_ring_ * maximal_edge_lenght_ring_;
+    int minimal_pixel_count_ring_ = maximal_edge_length_core_ * maximal_edge_length_core_;
+    int maximal_edge_length_ring_ = maximal_edge_length_core_ * 3;
+    int maximal_pixel_count_ring_ = maximal_edge_length_ring_ * maximal_edge_length_ring_;
 
-    float reduction_in_edge_lenght_ring_ = 0.8f;
+    float reduction_in_edge_length_ring_ = 0.8f;
 
     float interia_ratio_ = 0.4f;
 

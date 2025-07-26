@@ -18,7 +18,7 @@ bool identification::test_smoothens_of_edges(const Eigen::Matrix<std::optional<i
             }
             const int own_idx = ordering(row, col).value();
 
-            std::vector<float> edge_lenght;
+            std::vector<float> edge_length;
             float average = 0.0f;
             for (const auto [off_row, off_col] : offsets)
             {
@@ -27,16 +27,16 @@ bool identification::test_smoothens_of_edges(const Eigen::Matrix<std::optional<i
                     continue;
                 }
                 const int neigbour_idx = ordering(row + off_row, col + off_col).value();
-                edge_lenght.emplace_back((Eigen::Vector2f(ring[own_idx].row_, ring[own_idx].col_) -
+                edge_length.emplace_back((Eigen::Vector2f(ring[own_idx].row_, ring[own_idx].col_) -
                                           Eigen::Vector2f(ring[neigbour_idx].row_, ring[neigbour_idx].col_))
                                              .norm());
-                average += edge_lenght.back();
+                average += edge_length.back();
             }
-            average /= edge_lenght.size();
+            average /= edge_length.size();
             const float min = average * edge_average_difference_allowed;
             const float max = average * (1.0f + edge_average_difference_allowed);
 
-            for (const auto len : edge_lenght)
+            for (const auto len : edge_length)
             {
                 if (len < min || len > max)
                 {

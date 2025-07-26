@@ -1,5 +1,6 @@
 #include "board.hpp"
 #include <variant>
+#include "board_params_io.hpp"
 
 namespace
 {
@@ -56,6 +57,18 @@ void Board::apply_scale(const float factor)
 
 // BoardRectGrid
 
+BoardRectGrid::BoardRectGrid()
+{
+    init_params(Params{});
+    setup_markers();
+}
+
+BoardRectGrid::BoardRectGrid(const Params& params)
+{
+    init_params(params);
+    setup_markers();
+}
+
 int BoardRectGrid::marker_distance_01() const { return row_down_ - row_top_; }
 
 int BoardRectGrid::marker_distance_12() const { return col_right_ - col_down_; }
@@ -80,15 +93,29 @@ std::vector<std::pair<int, int>> BoardRectGrid::marker_lines_12_locations() cons
     return ordering_markers;
 }
 
-BoardRectGrid::BoardRectGrid()
+void BoardRectGrid::init_params(const Params& params)
 {
     type_ = BoardType::RECT;
-    rows_ = 17;
-    cols_ = 23;
-    inner_radius_ = 2.5f;     // [mm]
-    outer_radius_ = 5.f;      // [mm]
-    spacing_rows_ = 16.217f;  // [mm]
-    spacing_cols_ = 16.217f;  // [mm]
+    rows_ = params.rows;
+    cols_ = params.cols;
+    inner_radius_ = params.inner_radius;
+    outer_radius_ = params.outer_radius;
+    spacing_rows_ = params.spacing_rows;
+    spacing_cols_ = params.spacing_cols;
+
+    row_top_ = params.row_top;
+    col_top_ = params.col_top;
+    row_down_ = params.row_down;
+    col_down_ = params.col_down;
+    row_right_ = params.row_right;
+    col_right_ = params.col_right;
+    row_non_unique_ = params.row_non_unique;
+    col_non_unique_ = params.col_non_unique;
+    edge_average_difference_allowed_ = params.edge_average_difference_allowed;
+}
+
+void BoardRectGrid::setup_markers()
+{
     top_left_ = Eigen::Vector3d(spacing_cols_ + outer_radius_, spacing_rows_ + outer_radius_, 0);
     bottom_right_ = Eigen::Vector3d((cols_ + 1.0) * spacing_cols_ + outer_radius_,
                                     (rows_ + 1.0) * spacing_rows_ + outer_radius_, 0.0);
@@ -161,6 +188,45 @@ void BoardHexGrid::setup_markers()
     }
 }
 
+BoardRectGrid::Params board::get_rect_params(const std::vector<std::variant<int, float>>& board_params)
+{
+    BoardRectGrid::Params params;
+    switch (board_params.size())
+    {
+        case 15:
+            params.edge_average_difference_allowed = std::get<int>(board_params.at(14));
+        case 14:
+            params.col_non_unique = std::get<int>(board_params.at(13));
+        case 13:
+            params.row_non_unique = std::get<int>(board_params.at(12));
+        case 12:
+            params.col_right = std::get<int>(board_params.at(11));
+        case 11:
+            params.row_right = std::get<int>(board_params.at(10));
+        case 10:
+            params.col_down = std::get<int>(board_params.at(9));
+        case 9:
+            params.row_down = std::get<float>(board_params.at(8));
+        case 8:
+            params.col_top = std::get<float>(board_params.at(7));
+        case 7:
+            params.row_top = std::get<float>(board_params.at(6));
+        case 6:
+            params.spacing_cols = std::get<int>(board_params.at(5));
+        case 5:
+            params.spacing_rows = std::get<int>(board_params.at(4));
+        case 4:
+            params.outer_radius = std::get<int>(board_params.at(3));
+        case 3:
+            params.inner_radius = std::get<int>(board_params.at(2));
+        case 2:
+            params.cols = std::get<int>(board_params.at(1));
+        case 1:
+            params.rows = std::get<int>(board_params.at(0));
+    }
+    return params;
+}
+
 BoardHexGrid::Params board::get_hex_params(const std::vector<std::variant<int, float>>& board_params)
 {
     BoardHexGrid::Params params;
@@ -187,18 +253,33 @@ BoardHexGrid::Params board::get_hex_params(const std::vector<std::variant<int, f
         case 1:
             params.rows = std::get<int>(board_params.at(0));
     }
-
     return params;
 }
 
-std::unique_ptr<Board> board::get_board(const int board_type, const std::vector<std::variant<int, float>>& board_params)
+std::unique_ptr<Board> board::get_board(const int board_type, const BoardHexGrid::Params& board_params)
 {
-    std::unique_ptr<Board> calibration_board;
     switch ((BoardType)board_type)
     {
         case BoardType::RECT:
             return std::make_unique<BoardRectGrid>();
         case BoardType::HEX:
-            return std::make_unique<BoardHexGrid>(get_hex_params(board_params));
+            return std::make_unique<BoardHexGrid>(board_params);
     }
+}
+
+std::unique_ptr<Board> board::get_board(const int board_type, const std::filesystem::path& directory_path)
+{
+    switch ((BoardType)board_type)
+    {
+        case BoardType::RECT:
+            return std::make_unique<BoardRectGrid>(io::read_params<BoardRectGrid::Params>(directory_path));
+        case BoardType::HEX:
+            return std::make_unique<BoardHexGrid>(io::read_params<BoardHexGrid::Params>(directory_path));
+    }
+}
+
+std::unique_ptr<Board> board::get_board(const int board_type,
+                                        const std::vector<std::variant<int, float>>& board_params_vec)
+{
+    return get_board(board_type, get_hex_params(board_params_vec));
 }

@@ -9,7 +9,7 @@ class CalibrateMono : public utils::Subcommand
     std::filesystem::path dataset_folder_;
     std::filesystem::path output_folder_;
     std::string camera_id_;
-    std::vector<std::variant<int, float>> board_params_;
+    std::vector<std::variant<int, float>> board_params_vec_;
     int board_type_ = 0;
 
    public:
@@ -22,7 +22,7 @@ class CalibrateMono : public utils::Subcommand
         add_dataset_path(cmd, dataset_folder_)->required();
         add_path_to_save(cmd, output_folder_)->default_val(io::save_path());
         add_camera(cmd, camera_id_);
-        add_board_params(cmd, board_params_);
+        add_board_params(cmd, board_params_vec_);
         add_board(cmd, board_type_);
     }
 

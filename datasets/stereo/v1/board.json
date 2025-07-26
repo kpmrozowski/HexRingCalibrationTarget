@@ -1,0 +1,14 @@
+{
+    "options_type": ["rect", "hex"],
+    "type": "hex",
+    "rows": 20,
+    "cols": 27,
+    "row_left": 9,
+    "col_left": 11,
+    "row_right": 9,
+    "col_right": 13,
+    "spacing_cols": 15.09,
+    "inner_radius": 2.5,
+    "outer_radius": 5.0,
+    "is_even": true
+}

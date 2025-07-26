@@ -1,8 +1,10 @@
 #pragma once
 
-#include <Eigen/Dense>
+#include <filesystem>
 #include <memory>
 #include <variant>
+
+#include <Eigen/Dense>
 
 enum class BoardType
 {
@@ -62,21 +64,42 @@ class Board
 class BoardRectGrid : public Board
 {
    public:
-    const int row_top_ = 4;
-    const int col_top_ = 4;
+    struct Params
+    {
+        int rows = 17;
+        int cols = 23;
+        float inner_radius = 2.5f;     // [mm]
+        float outer_radius = 5.f;      // [mm]
+        float spacing_rows = 16.217f;  // [mm]
+        float spacing_cols = 16.217f;  // [mm]
 
-    const int row_down_ = 12;
-    const int col_down_ = 4;
+        int row_top = 4;
+        int col_top = 4;
+        int row_down = 12;
+        int col_down = 4;
+        int row_right = 12;
+        int col_right = 18;
+        int row_non_unique = 4;
+        int col_non_unique = 18;
+        float edge_average_difference_allowed = 0.5f;
+    };
 
-    const int row_right_ = 12;
-    const int col_right_ = 18;
+    int row_top_;
+    int col_top_;
 
-    const int row_non_unique_ = 4;
-    const int col_non_unique_ = 18;
+    int row_down_;
+    int col_down_;
 
-    const float edge_average_difference_allowed_ = 0.5f;
+    int row_right_;
+    int col_right_;
+
+    int row_non_unique_;
+    int col_non_unique_;
+
+    float edge_average_difference_allowed_;
 
     BoardRectGrid();
+    BoardRectGrid(const Params& params);
 
     int marker_distance_01() const;
     int marker_distance_12() const;
@@ -86,6 +109,10 @@ class BoardRectGrid : public Board
     std::vector<std::pair<int, int>> marker_lines_12_locations() const;
 
     std::string_view name() override { return "RectRingCalibTarget"; }
+
+   private:
+    void init_params(const Params& params);
+    void setup_markers();
 };
 
 /**
@@ -190,8 +217,11 @@ class BoardHexGrid : public Board
 namespace board
 {
 
+BoardRectGrid::Params get_rect_params(const std::vector<std::variant<int, float>>& board_params);
 BoardHexGrid::Params get_hex_params(const std::vector<std::variant<int, float>>& board_params);
 
-std::unique_ptr<Board> get_board(const int board_type, const std::vector<std::variant<int, float>>& board_params);
+std::unique_ptr<Board> get_board(const int board_type, const BoardHexGrid::Params& board_params);
+std::unique_ptr<Board> get_board(const int board_type, const std::filesystem::path& directory_path);
+std::unique_ptr<Board> get_board(const int board_type, const std::vector<std::variant<int, float>>& board_params_vec);
 
 };  // namespace board

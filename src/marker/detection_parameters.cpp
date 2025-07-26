@@ -22,9 +22,9 @@ std::tuple<int, int, int> get_minimal_maximal_and_edge(const float focal_in_pixe
 
     const int maximal_pixel_count = maximal_inscribed_circle_size + 1;
 
-    const int max_edge_lenght = maximal_pixel_size + 1;
+    const int max_edge_length = maximal_pixel_size + 1;
 
-    return {minimal_pixel_count, maximal_pixel_count, max_edge_lenght};
+    return {minimal_pixel_count, maximal_pixel_count, max_edge_length};
 }
 
 }  // namespace
@@ -51,9 +51,9 @@ DetectionParameters::DetectionParameters(const float focal_in_pixel, const float
         u_norm * focal_in pixel = pixel size
     */
 
-    std::tie(minimal_pixel_count_core_, maximal_pixel_count_core_, maximal_edge_lenght_core_) =
+    std::tie(minimal_pixel_count_core_, maximal_pixel_count_core_, maximal_edge_length_core_) =
         get_minimal_maximal_and_edge(focal_in_pixel, core_dimension, min_z, max_z);
-    std::tie(minimal_pixel_count_ring_, maximal_pixel_count_ring_, maximal_edge_lenght_ring_) =
+    std::tie(minimal_pixel_count_ring_, maximal_pixel_count_ring_, maximal_edge_length_ring_) =
         get_minimal_maximal_and_edge(focal_in_pixel, ring_dimension, min_z, max_z);
 
     // for very small markers we set size to zero as quantization have huge infuence

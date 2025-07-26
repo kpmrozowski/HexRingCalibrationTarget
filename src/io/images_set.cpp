@@ -10,20 +10,6 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
-static std::pair<unsigned int, unsigned int> determine_resolution_of_rgb_image(const std::string& file_path)
-{
-    static constexpr std::pair<unsigned int, unsigned int> kRGBResolutions[] = {{4000, 3000}, {4032, 3024}};
-    unsigned int file_size = std::filesystem::file_size(file_path);
-    for (const auto [width, height] : kRGBResolutions)
-    {
-        if (width * height * 2 == file_size)
-        {
-            return {width, height};
-        }
-    }
-    throw std::invalid_argument("image '" + file_path + "' has unknown resolution");
-}
-
 const std::regex ImageFilesDataset::kRegexDataset = std::regex("^(\\w+)_(\\d+)$", std::regex_constants::ECMAScript);
 
 bool ImageFilesDataset::read_images_filenames(std::vector<ImageFileDescriptor>& result, const std::regex& regex) const
@@ -82,7 +68,6 @@ std::tuple<cv::Mat, int> ImageFileDescriptor::read_image() const
 {
     std::tuple<cv::Mat, int> return_image;
     cv::Mat img = cv::imread(path(), cv::IMREAD_UNCHANGED);
-    // cv::resize(img, img, cv::Size(img.cols / 8, img.rows / 8));
     std::get<0>(return_image) = img;
     std::get<1>(return_image) = id();
 

@@ -14,10 +14,12 @@ void CalibrateMono::execute()
 {
     std::map<int, base::ImageDecoding> decoded;
 
-    const std::unique_ptr<Board> calibration_board = board::get_board(board_type_, board_params_);
+    ImageFilesDataset images_set(dataset_folder_, camera_id_);
+    const auto data_container = images_set();
 
-    ImageFilesDataset dataset(dataset_folder_, camera_id_);
-    const auto data_container = dataset();
+    const std::unique_ptr<Board> calibration_board = !board_params_vec_.empty()
+                                                         ? board::get_board(board_type_, board_params_vec_)
+                                                         : board::get_board(board_type_, dataset_folder_);
 
     for (const ImageFileDescriptor& descriptor : data_container)
     {
@@ -26,7 +28,7 @@ void CalibrateMono::execute()
         const auto decoded_image = marker::detection::detect_and_identify(
             mat,
             marker::DetectionParameters(650.0, calibration_board->inner_radius_ * 2,
-                                        calibration_board->outer_radius_ * 2, 10.0, 100.0),
+                                        calibration_board->outer_radius_ * 2, 100.0, 1000.0),
             calibration_board, image_id);
 
         if (decoded_image.has_value())
