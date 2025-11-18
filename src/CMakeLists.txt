@@ -60,5 +60,6 @@ target_link_libraries(
     PRIVATE
       ${LIB_NAME}
       opencv::imgcodecs
+      opencv::calib3d
       HexRingCalibrationTarget::cmd_launcher
 )

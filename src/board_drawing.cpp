@@ -29,6 +29,12 @@ std::pair<float, float> on_image_location(const BoardHexGrid &board, const int r
     return on_image_location(board.row_and_col_to_id(row, col), board.marker_centers_, mm_per_pixel);
 }
 
+std::pair<float, float> on_image_location(const BoardCircleGrid &board, const int row, const int col,
+                                          const float mm_per_pixel)
+{
+    return on_image_location(board.row_and_col_to_id(row, col), board.marker_centers_, mm_per_pixel);
+}
+
 float percentage_outside(const float row_center, const float col_center, const float circle_row_center,
                          const float circle_col_center, const float radius_in_pixel_sq)
 {
@@ -93,16 +99,47 @@ void draw_footer(cv::Mat1b &image, const BoardHexGrid &board, const float mm_per
 
     const std::string footer = std::format(
         "HexBoard by k.mrozowski | {}x{} | Coding: ({},{}), ({},{}) | Spacing: {:0.3f} | Outer: {:0.3f} | Inner: "
-        "{:0.3f} | Is even: {}",
+        "{:0.3f} | Is even: {} | Scale: {}",
         board.rows_, board.cols_, board.row_left_, board.col_left_, board.row_right_, board.col_right_,
-        board.spacing_cols_, board.outer_radius_, board.inner_radius_, board.is_even_);
+        board.spacing_cols_ / board.scale_, board.outer_radius_ / board.scale_, board.inner_radius_ / board.scale_,
+        board.is_even_, board.scale_);
 
     spdlog::info("Footer: '{}'", footer);
     spdlog::debug(
         "name: '{}'",
-        std::format("hex-{}x{}-coding-{}-{}-{}-{}-spacing-{:0.3f}-outer-{:0.3f}-inner-{:0.3f}-even-{}", board.rows_,
-                    board.cols_, board.row_left_, board.col_left_, board.row_right_, board.col_right_,
-                    board.spacing_cols_, board.outer_radius_, board.inner_radius_, board.is_even_));
+        std::format("hex-{}x{}-coding-{}-{}-{}-{}-spacing-{:0.3f}-outer-{:0.3f}-inner-{:0.3f}-even-{}-scale-{:.6f}",
+                    board.rows_, board.cols_, board.row_left_, board.col_left_, board.row_right_, board.col_right_,
+                    board.spacing_cols_ / board.scale_, board.outer_radius_ / board.scale_,
+                    board.inner_radius_ / board.scale_, board.is_even_, board.scale_));
+
+    cv::putText(image, footer,
+                cv::Point(int(0.6 * (board.top_left_(0) - board.outer_radius_) / mm_per_pixel),
+                          int(0.6f * (board.top_left_(1) - board.outer_radius_) / mm_per_pixel)),
+                cv::FONT_HERSHEY_COMPLEX, footer_scale, cv::Scalar(0, 0, 0), footer_thickness, cv::LINE_AA, false);
+}
+
+void draw_footer(cv::Mat1b &image, const BoardCircleGrid &board, const float mm_per_pixel)
+{
+    const cv::HersheyFonts font_face = cv::FONT_HERSHEY_DUPLEX;
+    const float footer_height_mm = 1.5f;
+    const int footer_height_pixels = int(footer_height_mm / mm_per_pixel);
+    const int footer_thickness = 10;
+    const double footer_scale = getFontScaleFromHeight(font_face, footer_height_pixels, footer_thickness);
+    const auto [row_center, col_center] = on_image_location(board, board.rows_ - 1, 1, mm_per_pixel);
+
+    spdlog::info("footer_height_pixels={}, footer_scale={}, (c,r): ({}, {}), ({:0.3f}, {:0.3f})", footer_height_pixels,
+                 footer_scale, col_center, row_center, board.top_left_(0) / mm_per_pixel,
+                 board.bottom_right_(1) / mm_per_pixel);
+
+    const std::string footer = std::format(
+        "CircularBoard by k.mrozowski | {}x{} | Spacing: {:0.3f} | Outer: {:0.3f} | Is asymetric: {} | Scale: {}",
+        board.rows_, board.cols_, board.spacing_ / board.scale_, board.outer_radius_ / board.scale_,
+        board.is_asymetric_, board.scale_);
+
+    spdlog::info("Footer: '{}'", footer);
+    spdlog::debug("name: '{}'", std::format("hex-{}x{}-spacing-{:0.3f}-outer-{:0.3f}-asymetric-{}-scale-{:.6f}",
+                                            board.rows_, board.cols_, board.spacing_ / board.scale_,
+                                            board.outer_radius_ / board.scale_, board.is_asymetric_, board.scale_));
 
     cv::putText(image, footer,
                 cv::Point(int(0.6 * (board.top_left_(0) - board.outer_radius_) / mm_per_pixel),
@@ -150,7 +187,7 @@ cv::Mat1b board::draw_canonical_board(const BoardRectGrid &board, const float mm
     const float inner_radius_pix = board.inner_radius_ / mm_per_pixel;
     const float outer_radius_pix = board.outer_radius_ / mm_per_pixel;
 
-#pragma omp parallel for
+    // #pragma omp parallel for
     for (int row = 0; row < board.rows_; ++row)
     {
         for (int col = 0; col < board.cols_; ++col)
@@ -227,6 +264,46 @@ cv::Mat1b board::draw_canonical_board(const BoardHexGrid &board, const float mm_
                 draw_circle(image, row_center, col_center, outer_radius_pix, 0.0f, 255.0f);
                 draw_circle(image, row_center, col_center, inner_radius_pix, 255.0f, 0.0f);
             }
+        }
+    }
+
+    return image;
+}
+
+cv::Mat1b board::draw_canonical_board(const BoardCircleGrid &board, const float mm_per_pixel,
+                                      const cv::Size_<float> board_dimension_mm)
+{
+    const Eigen::Vector3f board_size_mm = board.bottom_right_.cast<float>();
+    spdlog::debug("board_size_mm=({:0.2f}, {:0.2f}), mm_per_pixel={:0.6f}", board_size_mm(0), board_size_mm(1),
+                  mm_per_pixel);
+
+    const int rows_needed = std::ceil(board_size_mm(1) / mm_per_pixel + 1);
+    const int cols_needed = std::ceil(board_size_mm(0) / mm_per_pixel + 1);
+
+    const int rows = int(board_dimension_mm.height / mm_per_pixel);
+    const int cols = int(board_dimension_mm.width / mm_per_pixel);
+
+    spdlog::debug("image.size=({}, {}), max_size=({}, {}), free_space=({}, {})", rows, cols, rows_needed, cols_needed,
+                  rows - rows_needed, cols - cols_needed);
+
+    cv::Mat1b image = cv::Mat1b(rows, cols, 255);
+    if (rows < rows_needed || cols < cols_needed)
+    {
+        throw std::invalid_argument("Board is too big for this DPI.");
+    }
+
+    const float outer_radius_pix = board.outer_radius_ / mm_per_pixel;
+
+    draw_footer(image, board, mm_per_pixel);
+
+#pragma omp parallel for
+    for (int row = 0; row < board.rows_; ++row)
+    {
+        for (int col = 0; col < board.cols_; ++col)
+        {
+            const auto [row_center, col_center] = on_image_location(board, row, col, mm_per_pixel);
+
+            draw_circle(image, row_center, col_center, outer_radius_pix, 10.0f, 255.0f);
         }
     }
 

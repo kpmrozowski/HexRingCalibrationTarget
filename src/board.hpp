@@ -10,6 +10,7 @@ enum class BoardType
 {
     RECT = 0,
     HEX = 1,
+    CIRCLE = 2,
 };
 class Board
 {
@@ -27,8 +28,16 @@ class Board
 
     std::vector<Eigen::Vector3d> marker_centers_;
 
+    std::vector<int> id_of_coding_;
+    bool is_coding(const int marker_id) const;
+
     Eigen::Vector3d top_left_;      // [mm]
     Eigen::Vector3d bottom_right_;  // [mm]
+
+    Eigen::Vector3d padding_top_left_ = Eigen::Vector3d::Zero();      // [mm]
+    Eigen::Vector3d padding_bottom_right_ = Eigen::Vector3d::Zero();  // [mm]
+
+    float scale_;
 
     virtual ~Board() = default;
     Eigen::Vector2i id_to_row_and_col(const int id) const;
@@ -177,7 +186,7 @@ class BoardHexGrid : public Board
         float spacing_cols = 11.6f;  // [mm]
         float inner_radius = 2.4f;   // [mm]
         float outer_radius = 4.8f;   // [mm]
-        bool is_even = true;
+        bool is_even = false;
     };
 
     int row_left_;
@@ -214,14 +223,52 @@ class BoardHexGrid : public Board
     void setup_markers();
 };
 
+class BoardCircleGrid : public Board
+{
+   public:
+    struct Params
+    {
+        int rows = 17;
+        int cols = 23;
+        float radius = 40.f;  // [mm]
+        float spacing = 120.f;
+
+        bool is_asymetric = true;
+    };
+
+    /**
+     *  Even:
+     * | * * * * * *
+     * |  * L * R * *
+     * | * * * * * *
+     * |  * * * * * *
+     *  Odd:
+     * |  * * * * * *
+     * | * L * R * *
+     * |  * * * * * *
+     * | * * * * * *
+     */
+    bool is_asymetric_;
+    float spacing_;
+
+    BoardCircleGrid();
+    BoardCircleGrid(const Params& params);
+
+    std::string_view name() override { return "CircleGridCalibTarget"; }
+
+   private:
+    void init_params(const Params& params);
+    void setup_markers();
+};
+
 namespace board
 {
 
-BoardRectGrid::Params get_rect_params(const std::vector<std::variant<int, float>>& board_params);
-BoardHexGrid::Params get_hex_params(const std::vector<std::variant<int, float>>& board_params);
+BoardRectGrid::Params get_rect_params(const std::vector<float>& board_params);
+BoardHexGrid::Params get_hex_params(const std::vector<float>& board_params);
+BoardCircleGrid::Params get_circle_params(const std::vector<float>& board_params);
 
-std::unique_ptr<Board> get_board(const int board_type, const BoardHexGrid::Params& board_params);
-std::unique_ptr<Board> get_board(const int board_type, const std::filesystem::path& directory_path);
-std::unique_ptr<Board> get_board(const int board_type, const std::vector<std::variant<int, float>>& board_params_vec);
+std::unique_ptr<Board> get_board(const int board_type, const std::vector<float>& board_params_vec);
+std::unique_ptr<Board> get_board(const std::filesystem::path& filepath);
 
 };  // namespace board

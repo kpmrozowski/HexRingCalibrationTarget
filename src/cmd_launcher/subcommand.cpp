@@ -43,7 +43,7 @@ CLI::Option* Subcommand::add_board(CLI::App& cmd, int& board_type)
     return cmd.add_option("-b, --board", board_type, "Board type: 0->RectGrid, 1->HexGrid");
 }
 
-CLI::Option* Subcommand::add_board_params(CLI::App& cmd, std::vector<std::variant<int, float>>& board_params)
+CLI::Option* Subcommand::add_board_params(CLI::App& cmd, std::vector<float>& board_params)
 {
     return cmd.add_option("-p, --board-params", board_params,
                           "Params for HexRingCalibTarget: [rows, cols, row_left, col_left, row_right, col_right], "

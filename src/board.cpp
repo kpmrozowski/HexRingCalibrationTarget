@@ -1,9 +1,11 @@
 #include "board.hpp"
-#include <variant>
+
 #include "board_params_io.hpp"
 
 namespace
 {
+constexpr float kEquilateralTriangleHeight = std::numbers::sqrt3_v<float> / 2.f;
+
 Eigen::Vector3d marker_localization(const BoardRectGrid& board, const int row, const int col)
 {
     return board.top_left_ + Eigen::Vector3d(col * board.spacing_cols_, row * board.spacing_rows_, 0.0);
@@ -21,9 +23,33 @@ Eigen::Vector3d marker_localization(const BoardHexGrid& board, const int row, co
     }
 }
 
+Eigen::Vector3d marker_localization(const BoardCircleGrid& board, const int row, const int col)
+{
+    if (board.is_asymetric_)
+    {
+        return board.top_left_ + Eigen::Vector3d((2 * col + row % 2) * board.spacing_, row * board.spacing_, 0.0);
+    }
+    else
+    {  // symmetric grid
+        return board.top_left_ + Eigen::Vector3d(board.spacing_ * row, board.spacing_ * col, 0.0);
+    }
+}
+
 }  // namespace
 
 // Board
+
+bool Board::is_coding(const int marker_id) const
+{
+    for (const auto coding_id : id_of_coding_)
+    {
+        if (coding_id == marker_id)
+        {
+            return true;
+        }
+    }
+    return false;
+}
 
 Eigen::Vector2i Board::id_to_row_and_col(const int id) const
 {
@@ -40,17 +66,21 @@ int Board::row_and_col_to_id(const int row, const int col) const
 
 void Board::apply_scale(const float factor)
 {
+    scale_ = factor;
     inner_radius_ *= factor;
     outer_radius_ *= factor;
     spacing_rows_ *= factor;
     spacing_cols_ *= factor;
-    top_left_ *= factor;
-    bottom_right_ *= factor;
+    top_left_ = (top_left_ - padding_top_left_) * factor + padding_top_left_;
+    bottom_right_ = (bottom_right_ - padding_top_left_ - padding_bottom_right_) * factor + padding_top_left_ +
+                    padding_bottom_right_;
+
     for (int row = 0; row < rows_; ++row)
     {
         for (int col = 0; col < cols_; ++col)
         {
-            marker_centers_[col + row * cols_] *= factor;
+            Eigen::Vector3d& marker = marker_centers_[col + row * cols_];
+            marker = (marker - top_left_) * factor + top_left_;
         }
     }
 }
@@ -112,13 +142,20 @@ void BoardRectGrid::init_params(const Params& params)
     row_non_unique_ = params.row_non_unique;
     col_non_unique_ = params.col_non_unique;
     edge_average_difference_allowed_ = params.edge_average_difference_allowed;
+
+    padding_top_left_ = Eigen::Vector3d(spacing_cols_ + outer_radius_, spacing_rows_ + outer_radius_, 0);
+    padding_bottom_right_ = padding_top_left_;
+
+    id_of_coding_ = {row_and_col_to_id(row_top_, col_top_), row_and_col_to_id(row_down_, col_down_),
+                     row_and_col_to_id(row_right_, col_right_)};
 }
 
 void BoardRectGrid::setup_markers()
 {
-    top_left_ = Eigen::Vector3d(spacing_cols_ + outer_radius_, spacing_rows_ + outer_radius_, 0);
-    bottom_right_ = Eigen::Vector3d((cols_ + 1.0) * spacing_cols_ + outer_radius_,
-                                    (rows_ + 1.0) * spacing_rows_ + outer_radius_, 0.0);
+    top_left_ = padding_top_left_;
+    bottom_right_ = padding_top_left_ + padding_bottom_right_ +
+                    Eigen::Vector3d((cols_ - 1.0) * spacing_cols_ - outer_radius_,
+                                    (rows_ - 1.0) * spacing_rows_ - outer_radius_, 0.0);
 
     for (int row = 0; row < rows_; ++row)
     {
@@ -168,16 +205,23 @@ void BoardHexGrid::init_params(const Params& params)
     inner_radius_ = params.inner_radius;
     outer_radius_ = params.outer_radius;
     is_even_ = params.is_even;
+    scale_ = 1.0f;
+
+    spacing_rows_ = kEquilateralTriangleHeight * spacing_cols_;
+    padding_top_left_ = Eigen::Vector3d(spacing_cols_ + 15, spacing_rows_ + 20, 0);
+    padding_bottom_right_ = Eigen::Vector3d(0.0, 0, 0);
+
+    id_of_coding_ = {
+        row_and_col_to_id(row_left_, col_left_),
+        row_and_col_to_id(row_right_, col_right_),
+    };
 }
 
 void BoardHexGrid::setup_markers()
 {
-    static constexpr float kEquilateralTriangleHeight = std::numbers::sqrt3_v<float> / 2.f;
-
-    spacing_rows_ = kEquilateralTriangleHeight * spacing_cols_;
-    top_left_ = 2. * Eigen::Vector3d(outer_radius_, outer_radius_, 0);
-    bottom_right_ =
-        Eigen::Vector3d((cols_ + 0.5) * spacing_cols_ + outer_radius_, rows_ * spacing_rows_ + outer_radius_, 0.0);
+    top_left_ = padding_top_left_;
+    bottom_right_ = padding_top_left_ + padding_bottom_right_ +
+                    Eigen::Vector3d((cols_ + 0.5) * spacing_cols_, rows_ * spacing_rows_, 0.0);
 
     for (int row = 0; row < rows_; ++row)
     {
@@ -188,98 +232,161 @@ void BoardHexGrid::setup_markers()
     }
 }
 
-BoardRectGrid::Params board::get_rect_params(const std::vector<std::variant<int, float>>& board_params)
+// BoardCircleGrid
+
+BoardCircleGrid::BoardCircleGrid()
+{
+    init_params(Params{});
+    setup_markers();
+}
+
+BoardCircleGrid::BoardCircleGrid(const Params& params)
+{
+    init_params(params);
+    setup_markers();
+}
+
+void BoardCircleGrid::init_params(const Params& params)
+{
+    type_ = BoardType::CIRCLE;
+    rows_ = params.rows;
+    cols_ = params.cols;
+    outer_radius_ = params.radius;
+    spacing_ = params.spacing;
+    is_asymetric_ = params.is_asymetric;
+
+    padding_top_left_ = Eigen::Vector3d(outer_radius_ + 20, outer_radius_ + 15, 0);  // cols, rows
+    padding_bottom_right_ = Eigen::Vector3d(0.0, 0, 0);
+
+    id_of_coding_ = {0};
+}
+
+void BoardCircleGrid::setup_markers()
+{
+    top_left_ = padding_top_left_;
+    bottom_right_ =
+        padding_top_left_ + padding_bottom_right_ +
+        Eigen::Vector3d((cols_ - 1.0) * spacing_ - outer_radius_, (rows_ - 1.0) * spacing_ - outer_radius_, 0.0);
+
+    for (int row = 0; row < rows_; ++row)
+    {
+        for (int col = 0; col < cols_; ++col)
+        {
+            marker_centers_.emplace_back(marker_localization(*this, row, col));
+        }
+    }
+}
+
+BoardRectGrid::Params board::get_rect_params(const std::vector<float>& board_params)
 {
     BoardRectGrid::Params params;
     switch (board_params.size())
     {
         case 15:
-            params.edge_average_difference_allowed = std::get<int>(board_params.at(14));
+            params.edge_average_difference_allowed = board_params.at(14);
         case 14:
-            params.col_non_unique = std::get<int>(board_params.at(13));
+            params.col_non_unique = board_params.at(13);
         case 13:
-            params.row_non_unique = std::get<int>(board_params.at(12));
+            params.row_non_unique = board_params.at(12);
         case 12:
-            params.col_right = std::get<int>(board_params.at(11));
+            params.col_right = board_params.at(11);
         case 11:
-            params.row_right = std::get<int>(board_params.at(10));
+            params.row_right = board_params.at(10);
         case 10:
-            params.col_down = std::get<int>(board_params.at(9));
+            params.col_down = board_params.at(9);
         case 9:
-            params.row_down = std::get<float>(board_params.at(8));
+            params.row_down = board_params.at(8);
         case 8:
-            params.col_top = std::get<float>(board_params.at(7));
+            params.col_top = board_params.at(7);
         case 7:
-            params.row_top = std::get<float>(board_params.at(6));
+            params.row_top = board_params.at(6);
         case 6:
-            params.spacing_cols = std::get<int>(board_params.at(5));
+            params.spacing_cols = board_params.at(5);
         case 5:
-            params.spacing_rows = std::get<int>(board_params.at(4));
+            params.spacing_rows = board_params.at(4);
         case 4:
-            params.outer_radius = std::get<int>(board_params.at(3));
+            params.outer_radius = board_params.at(3);
         case 3:
-            params.inner_radius = std::get<int>(board_params.at(2));
+            params.inner_radius = board_params.at(2);
         case 2:
-            params.cols = std::get<int>(board_params.at(1));
+            params.cols = board_params.at(1);
         case 1:
-            params.rows = std::get<int>(board_params.at(0));
+            params.rows = board_params.at(0);
     }
     return params;
 }
 
-BoardHexGrid::Params board::get_hex_params(const std::vector<std::variant<int, float>>& board_params)
+BoardHexGrid::Params board::get_hex_params(const std::vector<float>& board_params)
 {
     BoardHexGrid::Params params;
     switch (board_params.size())
     {
         case 10:
-            params.is_even = std::get<int>(board_params.at(9)) != 0;
+            params.is_even = board_params.at(9) != 0;
         case 9:
-            params.outer_radius = std::get<float>(board_params.at(8));
+            params.outer_radius = board_params.at(8);
         case 8:
-            params.inner_radius = std::get<float>(board_params.at(7));
+            params.inner_radius = board_params.at(7);
         case 7:
-            params.spacing_cols = std::get<float>(board_params.at(6));
+            params.spacing_cols = board_params.at(6);
         case 6:
-            params.col_right = std::get<int>(board_params.at(5));
+            params.col_right = board_params.at(5);
         case 5:
-            params.row_right = std::get<int>(board_params.at(4));
+            params.row_right = board_params.at(4);
         case 4:
-            params.col_left = std::get<int>(board_params.at(3));
+            params.col_left = board_params.at(3);
         case 3:
-            params.row_left = std::get<int>(board_params.at(2));
+            params.row_left = board_params.at(2);
         case 2:
-            params.cols = std::get<int>(board_params.at(1));
+            params.cols = board_params.at(1);
         case 1:
-            params.rows = std::get<int>(board_params.at(0));
+            params.rows = board_params.at(0);
     }
     return params;
 }
 
-std::unique_ptr<Board> board::get_board(const int board_type, const BoardHexGrid::Params& board_params)
+BoardCircleGrid::Params board::get_circle_params(const std::vector<float>& board_params)
+{
+    BoardCircleGrid::Params params;
+    switch (board_params.size())
+    {
+        case 5:
+            params.is_asymetric = board_params.at(4) != 0;
+        case 4:
+            params.radius = board_params.at(3);
+        case 3:
+            params.spacing = board_params.at(2);
+        case 2:
+            params.cols = board_params.at(1);
+        case 1:
+            params.rows = board_params.at(0);
+    }
+    return params;
+}
+
+std::unique_ptr<Board> board::get_board(const int board_type, const std::vector<float>& board_params_vec)
 {
     switch ((BoardType)board_type)
     {
         case BoardType::RECT:
-            return std::make_unique<BoardRectGrid>();
+            return std::make_unique<BoardRectGrid>(get_rect_params(board_params_vec));
         case BoardType::HEX:
-            return std::make_unique<BoardHexGrid>(board_params);
+            return std::make_unique<BoardHexGrid>(get_hex_params(board_params_vec));
+        case BoardType::CIRCLE:
+            return std::make_unique<BoardCircleGrid>(get_circle_params(board_params_vec));
     }
 }
 
-std::unique_ptr<Board> board::get_board(const int board_type, const std::filesystem::path& directory_path)
+std::unique_ptr<Board> board::get_board(const std::filesystem::path& filepath)
 {
-    switch ((BoardType)board_type)
+    const io::BoardParams board_params = io::read_params(filepath);
+    switch (board_params.type_)
     {
         case BoardType::RECT:
-            return std::make_unique<BoardRectGrid>(io::read_params<BoardRectGrid::Params>(directory_path));
+            return std::make_unique<BoardRectGrid>(board_params.params_rect);
         case BoardType::HEX:
-            return std::make_unique<BoardHexGrid>(io::read_params<BoardHexGrid::Params>(directory_path));
+            return std::make_unique<BoardHexGrid>(board_params.params_hex);
+        case BoardType::CIRCLE:
+            return std::make_unique<BoardCircleGrid>(board_params.params_circle);
     }
-}
-
-std::unique_ptr<Board> board::get_board(const int board_type,
-                                        const std::vector<std::variant<int, float>>& board_params_vec)
-{
-    return get_board(board_type, get_hex_params(board_params_vec));
 }

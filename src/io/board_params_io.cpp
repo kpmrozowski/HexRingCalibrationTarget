@@ -40,18 +40,27 @@ constexpr std::string_view kOuterRadius = "outer_radius";
 constexpr std::string_view kIsEven = "is_even";
 }  // namespace hex
 
+namespace circle
+{
+constexpr std::string_view kRows = "rows";
+constexpr std::string_view kCols = "cols";
+constexpr std::string_view kSpacing = "spacing";
+constexpr std::string_view kRadius = "radius";
+constexpr std::string_view kIsAsymetric = "is_asymetric";
+}  // namespace circle
+
 namespace
 {
 
 static const std::map<std::string_view, BoardType> kNameToBoardType{
     {"rect", BoardType::RECT},
     {"hex", BoardType::HEX},
+    {"circle", BoardType::CIRCLE},
 };
 
-static constexpr std::string_view kBoardParamsJsonName = "board";
 static constexpr std::string_view kType = "type";
 
-io::BoardVariants read_params_rect(const nlohmann::json& json)
+BoardRectGrid::Params read_params_rect(const nlohmann::json& json)
 {
     return BoardRectGrid::Params{
         .rows = json[rect::kRows].get<int>(),
@@ -72,7 +81,7 @@ io::BoardVariants read_params_rect(const nlohmann::json& json)
     };
 }
 
-std::variant<BoardRectGrid::Params, BoardHexGrid::Params> read_params_hex(const nlohmann::json& json)
+BoardHexGrid::Params read_params_hex(const nlohmann::json& json)
 {
     return BoardHexGrid::Params{
         .rows = json[hex::kRows.data()].get<int>(),
@@ -88,13 +97,30 @@ std::variant<BoardRectGrid::Params, BoardHexGrid::Params> read_params_hex(const 
     };
 }
 
+BoardCircleGrid::Params read_params_circle(const nlohmann::json& json)
+{
+    return BoardCircleGrid::Params{
+        .rows = json[circle::kRows.data()].get<int>(),
+        .cols = json[circle::kCols.data()].get<int>(),
+        .radius = json[circle::kRadius.data()].get<float>(),
+        .spacing = json[circle::kSpacing.data()].get<float>(),
+        .is_asymetric = json[circle::kIsAsymetric.data()].get<bool>(),
+    };
+}
+
 }  // namespace
 
-template <typename BoardParamsType>
-BoardParamsType io::read_params(const std::filesystem::path& directory_path)
+io::BoardParams io::read_params(const std::filesystem::path& filepath)
 {
+    const auto board_params_filepath = filepath;
+    if (!std::filesystem::exists(board_params_filepath))
+    {
+        throw std::invalid_argument(
+            std::format("Error loading '{}'. File does not exist.", board_params_filepath.string()));
+    }
+
     // Load dataset metadata
-    std::ifstream file(directory_path / (std::string(kBoardParamsJsonName) + ".json"));
+    std::ifstream file(board_params_filepath);
     nlohmann::json json;
     file >> json;
 
@@ -102,17 +128,23 @@ BoardParamsType io::read_params(const std::filesystem::path& directory_path)
     if (!kNameToBoardType.contains(board_type_str))
     {
         throw std::invalid_argument(
-            std::format("Error loading '{}.json'. Unknown board type: {}.", kBoardParamsJsonName, board_type_str));
+            std::format("Error loading '{}.json'. Unknown board type: {}.", filepath.string(), board_type_str));
     }
 
-    switch (kNameToBoardType.at(board_type_str))
+    BoardParams params;
+    params.type_ = kNameToBoardType.at(board_type_str);
+
+    switch (params.type_)
     {
         case BoardType::RECT:
-            return std::get<BoardParamsType>(read_params_rect(json));
+            params.params_rect = read_params_rect(json);
+            break;
         case BoardType::HEX:
-            return std::get<BoardParamsType>(read_params_hex(json));
+            params.params_hex = read_params_hex(json);
+            break;
+        case BoardType::CIRCLE:
+            params.params_circle = read_params_circle(json);
+            break;
     }
+    return params;
 }
-
-template BoardRectGrid::Params io::read_params(const std::filesystem::path& directory_path);
-template BoardHexGrid::Params io::read_params(const std::filesystem::path& directory_path);

@@ -1,0 +1,13 @@
+{
+    "type": "hex",
+    "rows": 14,
+    "cols": 17,
+    "row_left": 6,
+    "col_left": 7,
+    "row_right": 6,
+    "col_right": 9,
+    "spacing_cols": 22.8,
+    "inner_radius": 4.0,
+    "outer_radius": 9.0,
+    "is_even": false
+}

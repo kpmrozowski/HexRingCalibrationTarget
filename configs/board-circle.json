@@ -1,0 +1,8 @@
+{
+    "type": "circle",
+    "rows": 7,
+    "cols": 5,
+    "spacing": 38.0,
+    "radius": 20.0,
+    "is_asymetric": true
+}

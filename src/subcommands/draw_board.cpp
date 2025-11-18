@@ -1,5 +1,6 @@
 #include "draw_board.hpp"
 
+#include <opencv2/calib3d/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
 
 #include <spdlog/spdlog.h>
@@ -15,7 +16,6 @@ constexpr float kInchesPerMeter = 39.36f;
 constexpr float kInchesPerMillimeter = kInchesPerMeter / 1000.f;
 constexpr float kPointsPerInch = 72.00f;
 constexpr float kPointsPerMillimeter = kPointsPerInch * kInchesPerMillimeter;
-constexpr float kMagicDpiScale = 2710 / 420.f;
 
 /** @brief Point is a smallest unit of measurement in typography
  * @ref https://www.a4-size.com/a4-size-in-point
@@ -51,10 +51,9 @@ cv::Size_<float> get_board_dimension_mm(const int a_x)
     return resolution;
 }
 
-void save_board_tiff_real_scale(const cv::Mat1b &image, const float mm_per_pixel, const int dpi,
+void save_board_tiff_real_scale(const cv::Mat1b &image, const float mm_per_pixel, const int tiff_dpi,
                                 const std::string program_name, const std::string board_name)
 {
-    const float tiff_dpi = dpi * kMagicDpiScale;
     const int tiff_dpi_i32 = std::ceil(tiff_dpi);
     const std::filesystem::path dir_path = io::save_path() / program_name;
     std::filesystem::create_directories(dir_path);
@@ -64,6 +63,26 @@ void save_board_tiff_real_scale(const cv::Mat1b &image, const float mm_per_pixel
 
     cv::imwrite(full_filepath, image,
                 {cv::ImwriteFlags::IMWRITE_TIFF_XDPI, tiff_dpi_i32, cv::ImwriteFlags::IMWRITE_TIFF_YDPI, tiff_dpi_i32});
+}
+
+void test_detection(const cv::Mat1b &image, const BoardCircleGrid &board)
+{
+    const cv::Size pattern_size(board.cols_, board.rows_);
+    std::vector<cv::Point2f> centers(board.cols_ * board.rows_);
+
+    spdlog::info("findCirclesGrid");
+    const auto simetricity = board.is_asymetric_ ? cv::CALIB_CB_ASYMMETRIC_GRID : cv::CALIB_CB_SYMMETRIC_GRID;
+    if (const bool success = cv::findCirclesGrid(image, pattern_size, centers, simetricity); success)
+    {
+        for (size_t idx = 0; idx < centers.size(); ++idx)
+        {
+            spdlog::info("pt[{:02}]: ({:7.3f}, {:7.3f})", idx, centers[idx].x, centers[idx].y);
+        }
+    }
+    else
+    {
+        spdlog::warn("BoardCircleGrid detection failure! Lower the DPI to max 50.");
+    }
 }
 
 cv::Mat1b draw_canonical_board(const std::unique_ptr<Board> &calibration_board, const float mm_per_pixel,
@@ -85,6 +104,16 @@ cv::Mat1b draw_canonical_board(const std::unique_ptr<Board> &calibration_board, 
         return board::draw_canonical_board(*board_hex, mm_per_pixel, board_dimension_mm);
     }
 
+    BoardCircleGrid *const board_circle = dynamic_cast<BoardCircleGrid *const>(calibration_board.get());
+    if (board_circle)
+    {
+        const cv::Size_<float> board_dimension_mm = get_board_dimension_mm(resolution);
+        board_circle->apply_scale(1);
+        cv::Mat1b image = board::draw_canonical_board(*board_circle, mm_per_pixel, board_dimension_mm);
+        test_detection(image, *board_circle);
+        return image;
+    }
+
     throw std::invalid_argument("Wrong board type");
 }
 
@@ -92,12 +121,11 @@ cv::Mat1b draw_canonical_board(const std::unique_ptr<Board> &calibration_board, 
 
 void DrawBoard::execute()
 {
-    if (board_type_ > 1)
+    if (board_type_ < 0 || board_type_ > 2)
     {
         throw std::invalid_argument("Invalid board type.");
     }
-
-    if (board_type_ == 0 && !board_params_.empty())
+    else if (board_type_ == 0 && !board_params_.empty())
     {
         throw std::invalid_argument("RectRingCalibTarget board does not take parameters.");
     }
@@ -108,7 +136,19 @@ void DrawBoard::execute()
 
     const float mm_per_pixel = 1.f / (dpi_ * kInchesPerMillimeter);
 
-    const std::unique_ptr<Board> calibration_board = board::get_board(board_type_, board_params_);
+    std::unique_ptr<Board> calibration_board;
+    if (!board_params_.empty())
+    {
+        calibration_board = board::get_board(board_type_, board_params_);
+    }
+    else if (!board_params_path_.empty())
+    {
+        calibration_board = board::get_board(board_params_path_);
+    }
+    else
+    {
+        throw std::invalid_argument("Use --board-params or --board-params-path");
+    }
 
     const cv::Mat1b image = draw_canonical_board(calibration_board, mm_per_pixel, resolution_);
 

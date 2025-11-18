@@ -19,7 +19,7 @@ void CalibrateMono::execute()
 
     const std::unique_ptr<Board> calibration_board = !board_params_vec_.empty()
                                                          ? board::get_board(board_type_, board_params_vec_)
-                                                         : board::get_board(board_type_, dataset_folder_);
+                                                         : board::get_board(board_params_path_);
 
     for (const ImageFileDescriptor& descriptor : data_container)
     {

@@ -1,0 +1,18 @@
+{
+    "type": "rect",
+    "rows": 17,
+    "cols": 23,
+    "inner_radius": 2.5,
+    "outer_radius": 5.0,
+    "spacing_rows": 16.217,
+    "spacing_cols": 16.217,
+    "row_top": 4,
+    "col_top": 4,
+    "row_down": 12,
+    "col_down": 4,
+    "row_right": 12,
+    "col_right": 18,
+    "row_non_unique": 4,
+    "col_non_unique": 18,
+    "edge_average_difference_allowed": 0.5
+}

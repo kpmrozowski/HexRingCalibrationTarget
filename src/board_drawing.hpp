@@ -32,4 +32,10 @@ cv::Mat1b draw_canonical_board(const BoardRectGrid &board, const float mm_per_pi
 cv::Mat1b draw_canonical_board(const BoardHexGrid &board, const float mm_per_pixel,
                                const cv::Size_<float> board_dimension_mm);
 
+/**
+ * @brief Function allow to accurately draw image of calibration board.
+ */
+cv::Mat1b draw_canonical_board(const BoardCircleGrid &board, const float mm_per_pixel,
+                               const cv::Size_<float> board_dimension_mm);
+
 }  // namespace board
