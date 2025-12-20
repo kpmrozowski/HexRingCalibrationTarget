@@ -5,6 +5,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "identification/board_circle/identification_circle.hpp"
 #include "images_set.hpp"
 #include "initial_calibration/debug.hpp"
 #include "initial_calibration/precalibration.hpp"
@@ -21,15 +22,34 @@ void CalibrateMono::execute()
                                                          ? board::get_board(board_type_, board_params_vec_)
                                                          : board::get_board(board_params_path_);
 
+    identification::circlegrid::TrackingState tracker_state;
+
     for (const ImageFileDescriptor& descriptor : data_container)
     {
         const auto [image, image_id] = descriptor.read_image();
         cv::Mat1b mat = image;
-        const auto decoded_image = marker::detection::detect_and_identify(
-            mat,
-            marker::DetectionParameters(650.0, calibration_board->inner_radius_ * 2,
-                                        calibration_board->outer_radius_ * 2, 100.0, 1000.0),
-            calibration_board, image_id);
+        const auto decoded_image = [&]() -> std::optional<base::ImageDecoding>
+        {
+            if (calibration_board->type_ == BoardType::CIRCLE)
+            {
+                const BoardCircleGrid* circle_board =
+                    dynamic_cast<const BoardCircleGrid*>(calibration_board.get());
+
+                return marker::detection::detect_and_identify_circlegrid(
+                    mat,
+                    marker::DetectionParameters(650.0, circle_board->outer_radius_ * 2,
+                                                circle_board->outer_radius_ * 2, 100.0, 1000.0),
+                    *circle_board, tracker_state, image_id);
+            }
+            else
+            {
+                return marker::detection::detect_and_identify(
+                    mat,
+                    marker::DetectionParameters(650.0, calibration_board->inner_radius_ * 2,
+                                                calibration_board->outer_radius_ * 2, 100.0, 1000.0),
+                    calibration_board, image_id);
+            }
+        }();
 
         if (decoded_image.has_value())
         {

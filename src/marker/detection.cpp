@@ -1,8 +1,10 @@
 #include "detection.hpp"
 
+#include <algorithm>
 #include <filesystem>
 
 #include <spdlog/spdlog.h>
+#include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include <io/debug.hpp>
@@ -11,6 +13,7 @@
 #include "thresholds.hpp"
 
 #include "debug.hpp"
+#include "identification/board_circle/identification_circle.hpp"
 #include "identification/identification.hpp"
 #include "symmetries.hpp"
 
@@ -519,4 +522,312 @@ std::optional<base::ImageDecoding> detect_and_identify(cv::Mat1b &input, const D
     return base::ImageDecoding(input, binarized, inverted_binarization, decoding->ordering(), decoding->markers,
                                marker_area, calibrated_area);
 }
+
+namespace marker::detection::detail
+{
+/**
+ * @brief Custom blob detector that returns pre-detected keypoints.
+ *        This allows us to use findCirclesGrid with our own marker detection.
+ */
+class PredetectedBlobDetector : public cv::Feature2D
+{
+   public:
+    explicit PredetectedBlobDetector(const std::vector<cv::KeyPoint> &keypoints) : keypoints_(keypoints) {}
+    ~PredetectedBlobDetector() override = default;
+
+    void detect(cv::InputArray, std::vector<cv::KeyPoint> &keypoints,
+                cv::InputArray = cv::noArray()) override
+    {
+        keypoints = keypoints_;
+    }
+
+   private:
+    std::vector<cv::KeyPoint> keypoints_;
+};
+
+/**
+ * @brief Tests if the detected markers can form a valid grid pattern using findCirclesGrid.
+ *
+ * @param coding_markers Detected coding markers
+ * @param board Board definition
+ * @param image_rows Image height
+ * @param image_cols Image width
+ * @return true if findCirclesGrid successfully detects the full pattern
+ */
+bool test_find_circles_grid(const std::vector<base::MarkerCoding> &coding_markers, const BoardCircleGrid &board,
+                            const int image_rows, const int image_cols)
+{
+    if (coding_markers.size() < static_cast<size_t>(board.rows_ * board.cols_))
+    {
+        return false;
+    }
+
+    // Convert markers to keypoints
+    std::vector<cv::KeyPoint> keypoints;
+    keypoints.reserve(coding_markers.size());
+    for (const auto &marker : coding_markers)
+    {
+        const float size = static_cast<float>(marker.width_ring_ + marker.height_ring_) / 2.0f;
+        keypoints.emplace_back(cv::Point2f(marker.col_, marker.row_), size);
+    }
+
+    // Create a dummy image (findCirclesGrid needs an image for size info)
+    cv::Mat1b dummy_image = cv::Mat1b::zeros(image_rows, image_cols);
+
+    // Create a blob detector that returns our pre-detected keypoints
+    cv::Ptr<cv::Feature2D> blob_detector = cv::makePtr<PredetectedBlobDetector>(keypoints);
+
+    const cv::Size pattern_size(board.cols_, board.rows_);
+    std::vector<cv::Point2f> centers;
+    int flags = board.is_asymetric_ ? cv::CALIB_CB_ASYMMETRIC_GRID : cv::CALIB_CB_SYMMETRIC_GRID;
+    flags |= cv::CALIB_CB_CLUSTERING;  // Use clustering algorithm which works better with pre-detected points
+
+    return cv::findCirclesGrid(dummy_image, pattern_size, centers, flags, blob_detector);
+}
+}  // namespace marker::detection::detail
+
+std::optional<base::ImageDecoding> detect_and_identify_circlegrid(
+    cv::Mat1b &input, const DetectionParameters &parameters, const BoardCircleGrid &board,
+    identification::circlegrid::TrackingState &tracker_state, const int image_idx)
+{
+    spdlog::debug("Detecting circle grid markers in image {}", image_idx);
+
+    const int total_expected_markers = board.rows_ * board.cols_;
+
+    // Best result tracking - we keep only the best one to avoid memory issues with cv::Mat
+    std::vector<base::MarkerCoding> best_coding_markers;
+    cv::Mat1b best_input;
+    cv::Mat1b best_binarized;
+    cv::Mat1b best_inverted_binarization;
+    float best_brightness_scale = 1.0f;
+    bool best_find_circles_grid_succeeded = false;
+    size_t best_marker_count = 0;
+
+    for (size_t brightness_scale_idx = 0; brightness_scale_idx < parameters.brightness_scales_.size();
+         ++brightness_scale_idx)
+    {
+        const float brightness_scale = parameters.brightness_scales_[brightness_scale_idx];
+
+        cv::Mat1b input_scaled;
+        if (brightness_scale != 1.0f)
+        {
+            input.convertTo(input_scaled, input_scaled.type(), brightness_scale);
+        }
+        else
+        {
+            input_scaled = input.clone();
+        }
+
+        cv::Mat1b binarized_temp = binarize(input_scaled, parameters);
+
+        cv::Mat1b inverted_binarization_temp;
+        cv::bitwise_not(binarized_temp, inverted_binarization_temp);
+
+        auto ring_and_coding =
+            filter_as_objects_simple_descriptors_rings(input_scaled, inverted_binarization_temp, parameters);
+
+        std::vector<base::MarkerCoding> coding_markers_temp;
+        for (const auto &m : ring_and_coding)
+        {
+            if (m.type_ == base::Type::CODING)
+            {
+                coding_markers_temp.emplace_back(m.label_, m.row_, m.col_, m.width_, m.height_, m.black_value_,
+                                                  m.white_value_);
+            }
+        }
+
+        // Test if this set of markers passes findCirclesGrid
+        const bool find_circles_grid_succeeded =
+            coding_markers_temp.size() >= static_cast<size_t>(total_expected_markers);
+
+        spdlog::info("image {}: brightness scale {}: found {} coding markers, findCirclesGrid: {}", image_idx,
+                     brightness_scale, coding_markers_temp.size(),
+                     find_circles_grid_succeeded ? "PASS" : "FAIL");
+
+        // Decide if this result is better than the current best
+        // Priority:
+        // 1. Prefer results that pass findCirclesGrid (have >= expected markers)
+        // 2. Among passing results, prefer exactly the expected count (no extra outliers)
+        // 3. If same distance from expected, prefer more markers
+        bool is_better = false;
+        if (find_circles_grid_succeeded && !best_find_circles_grid_succeeded)
+        {
+            // This one passes findCirclesGrid, previous best didn't
+            is_better = true;
+        }
+        else if (find_circles_grid_succeeded && best_find_circles_grid_succeeded)
+        {
+            // Both pass - prefer exactly the expected count, or closer to it
+            const size_t expected = static_cast<size_t>(total_expected_markers);
+            const size_t curr_diff = coding_markers_temp.size() >= expected ? coding_markers_temp.size() - expected
+                                                                             : expected - coding_markers_temp.size();
+            const size_t best_diff =
+                best_marker_count >= expected ? best_marker_count - expected : expected - best_marker_count;
+
+            if (curr_diff < best_diff)
+            {
+                is_better = true;
+            }
+            else if (curr_diff == best_diff && coding_markers_temp.size() > best_marker_count)
+            {
+                is_better = true;
+            }
+        }
+        else if (!find_circles_grid_succeeded && !best_find_circles_grid_succeeded)
+        {
+            // Both fail - prefer more markers
+            if (coding_markers_temp.size() > best_marker_count)
+            {
+                is_better = true;
+            }
+        }
+
+        if (is_better)
+        {
+            best_coding_markers = std::move(coding_markers_temp);
+            best_input = input_scaled.clone();
+            best_binarized = binarized_temp.clone();
+            best_inverted_binarization = inverted_binarization_temp.clone();
+            best_brightness_scale = brightness_scale;
+            best_find_circles_grid_succeeded = find_circles_grid_succeeded;
+            best_marker_count = best_coding_markers.size();
+        }
+    }
+
+    if (best_coding_markers.empty())
+    {
+        spdlog::warn("image {}: no coding markers found at any brightness scale", image_idx);
+        return std::nullopt;
+    }
+
+    spdlog::info("image {}: selected brightness scale {} with {} markers (findCirclesGrid: {})", image_idx,
+                 best_brightness_scale, best_coding_markers.size(),
+                 best_find_circles_grid_succeeded ? "PASS" : "FAIL");
+
+    input = best_input.clone();
+    const cv::Mat1b binarized = best_binarized.clone();
+    const cv::Mat1b inverted_binarization = best_inverted_binarization.clone();
+    const std::vector<base::MarkerCoding> coding_markers = best_coding_markers;
+    const bool find_circles_grid_succeeded = best_find_circles_grid_succeeded;
+
+    if (coding_markers.empty())
+    {
+        spdlog::warn("image {}: no coding markers (full black circles) found", image_idx);
+        return std::nullopt;
+    }
+
+    std::vector<int> global_ids(coding_markers.size(), -1);
+    bool primary_succeeded = false;
+
+    // Attempt geometric grid identification
+    auto grid_result = identification::circlegrid::identify_with_findCirclesGrid(input, coding_markers, board);
+
+    if (grid_result.has_value())
+    {
+        global_ids = *grid_result;
+        const int identified_count =
+            static_cast<int>(std::count_if(global_ids.begin(), global_ids.end(), [](int id) { return id >= 0; }));
+        primary_succeeded = (identified_count == total_expected_markers);
+        spdlog::info("image {}: findCirclesGrid identified {} / {} markers", image_idx, identified_count,
+                     total_expected_markers);
+    }
+    else
+    {
+        spdlog::debug("image {}: findCirclesGrid returned nullopt", image_idx);
+    }
+
+    // Tracking is mandatory ONLY when less than total_expected_markers were detected
+    // (board has 35 markers, so partial visibility requires tracking)
+    // When we have >= 35 markers, the geometric identification should succeed
+    const bool tracking_mandatory = static_cast<int>(coding_markers.size()) < total_expected_markers;
+
+    // Use tracking only if mandatory (fewer markers than expected) OR if primary identification failed
+    // but we have a previous frame and enough markers
+    const bool use_tracking =
+        tracking_mandatory ||
+        (!primary_succeeded && tracker_state.has_previous_ &&
+         coding_markers.size() > static_cast<size_t>(total_expected_markers) * 0.3f);
+
+    if (use_tracking && tracker_state.has_previous_)
+    {
+        spdlog::info("image {}: Using tracking (reason: {}, markers={}/{})", image_idx,
+                     tracking_mandatory ? "fewer markers" : "identification failed", coding_markers.size(),
+                     total_expected_markers);
+
+        auto tracking_result = identification::circlegrid::identify_with_tracking(
+            tracker_state.prev_markers_, coding_markers, tracker_state.prev_global_ids_, 50.0f, 5.0f);
+
+        if (tracking_result.has_value())
+        {
+            global_ids = *tracking_result;
+            const int identified_count =
+                static_cast<int>(std::count_if(global_ids.begin(), global_ids.end(), [](int id) { return id >= 0; }));
+            spdlog::info("image {}: Tracking identified {} markers", image_idx, identified_count);
+        }
+    }
+    else if (tracking_mandatory && !tracker_state.has_previous_)
+    {
+        spdlog::warn("image {}: Tracking is mandatory but no previous frame available (markers={}/{})", image_idx,
+                     coding_markers.size(), total_expected_markers);
+    }
+
+    std::vector<base::MarkerRing> rings;
+    rings.reserve(coding_markers.size());
+    for (size_t i = 0; i < coding_markers.size(); ++i)
+    {
+        rings.emplace_back(coding_markers[i]);
+        if (i < global_ids.size())
+        {
+            rings.back().global_id_ = global_ids[i];
+        }
+    }
+
+    const size_t prev_count = tracker_state.has_previous_ ? tracker_state.prev_markers_.size() : 0;
+    if (coding_markers.size() > prev_count)
+    {
+        identification::circlegrid::identify_new_markers_by_row_lines(rings, board);
+    }
+
+    std::vector<int> current_ids;
+    current_ids.reserve(rings.size());
+    for (const auto &r : rings)
+    {
+        current_ids.push_back(r.global_id_);
+    }
+    tracker_state.update(coding_markers, current_ids);
+
+    Eigen::Matrix<std::optional<int>, -1, -1> ordering =
+        Eigen::Matrix<std::optional<int>, -1, -1>::Constant(board.rows_, board.cols_, std::nullopt);
+
+    int identified_markers = 0;
+    for (size_t i = 0; i < rings.size(); ++i)
+    {
+        if (rings[i].global_id_ >= 0)
+        {
+            const auto rc = board.id_to_row_and_col(rings[i].global_id_);
+            ordering(rc(0), rc(1)) = static_cast<int>(i);
+            ++identified_markers;
+        }
+    }
+
+    if (identified_markers == 0)
+    {
+        spdlog::warn("image {}: No circle grid markers identified", image_idx);
+        return std::nullopt;
+    }
+
+    spdlog::info("image {}: Final identification: {} / {} markers", image_idx, identified_markers, total_expected_markers);
+
+    const cv::Mat1b marker_area = create_marker_area(rings, input.rows, input.cols);
+    const cv::Mat1b calibrated_area = create_calibrated_area(rings, std::make_unique<BoardCircleGrid>(board), input.rows, input.cols);
+
+    if constexpr (kShowMarkers)
+    {
+        io::debug::save_image(marker_area, std::format("marker_area_circle_{}", image_idx), debug::kMarkersSubdir);
+        io::debug::save_image(calibrated_area, std::format("calibrated_area_circle_{}", image_idx), debug::kMarkersSubdir);
+    }
+
+    return base::ImageDecoding(input, binarized, inverted_binarization, ordering, rings, marker_area, calibrated_area);
+}
+
 }  // namespace marker::detection

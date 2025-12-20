@@ -1,4 +1,5 @@
 #include "board_params_io.hpp"
+#include <spdlog/spdlog.h>
 
 #include <format>
 #include <fstream>
@@ -134,6 +135,7 @@ io::BoardParams io::read_params(const std::filesystem::path& filepath)
 
     BoardParams params;
     params.type_ = kNameToBoardType.at(board_type_str);
+    spdlog::info("board_type: {}", board_type_str);
 
     switch (params.type_)
     {
