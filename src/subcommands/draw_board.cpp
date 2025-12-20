@@ -94,12 +94,13 @@ cv::Mat1b draw_canonical_board(const std::unique_ptr<Board> &calibration_board, 
         return board::draw_canonical_board(*board_grid, mm_per_pixel);
     }
 
+    const cv::Size_<float> default_board_dimension_mm = get_board_dimension_mm(kDefaultPaperDimension);
+    const cv::Size_<float> board_dimension_mm = get_board_dimension_mm(resolution);
+    const float board_scale = board_dimension_mm.width / default_board_dimension_mm.width;
+
     BoardHexGrid *const board_hex = dynamic_cast<BoardHexGrid *const>(calibration_board.get());
     if (board_hex)
     {
-        const cv::Size_<float> default_board_dimension_mm = get_board_dimension_mm(kDefaultPaperDimension);
-        const cv::Size_<float> board_dimension_mm = get_board_dimension_mm(resolution);
-        const float board_scale = board_dimension_mm.width / default_board_dimension_mm.width;
         board_hex->apply_scale(board_scale);
         return board::draw_canonical_board(*board_hex, mm_per_pixel, board_dimension_mm);
     }
@@ -107,9 +108,8 @@ cv::Mat1b draw_canonical_board(const std::unique_ptr<Board> &calibration_board, 
     BoardCircleGrid *const board_circle = dynamic_cast<BoardCircleGrid *const>(calibration_board.get());
     if (board_circle)
     {
-        const cv::Size_<float> board_dimension_mm = get_board_dimension_mm(resolution);
-        board_circle->apply_scale(1);
-        cv::Mat1b image = board::draw_canonical_board(*board_circle, mm_per_pixel, board_dimension_mm);
+        board_circle->apply_scale(board_scale);
+        const cv::Mat1b image = board::draw_canonical_board(*board_circle, mm_per_pixel, board_dimension_mm);
         test_detection(image, *board_circle);
         return image;
     }
@@ -152,6 +152,6 @@ void DrawBoard::execute()
 
     const cv::Mat1b image = draw_canonical_board(calibration_board, mm_per_pixel, resolution_);
 
-    const std::string filename = std::format("{}_A{}", calibration_board->name(), board_type_ == 1 ? resolution_ : 3);
+    const std::string filename = std::format("{}_A{}", calibration_board->name(), board_type_ != 0 ? resolution_ : 3);
     save_board_tiff_real_scale(image, mm_per_pixel, dpi_, name(), filename);
 }

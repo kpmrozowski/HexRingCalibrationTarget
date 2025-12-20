@@ -4,5 +4,6 @@
     "cols": 5,
     "spacing": 38.0,
     "radius": 20.0,
-    "is_asymetric": true
+    "is_asymetric": true,
+    "padding_mm": [ 10, 5 ]
 }

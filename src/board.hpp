@@ -42,9 +42,9 @@ class Board
     virtual ~Board() = default;
     Eigen::Vector2i id_to_row_and_col(const int id) const;
     int row_and_col_to_id(const int row, const int col) const;
-    void apply_scale(const float factor);
 
     virtual std::string_view name() { return "dummy"; }
+    virtual void apply_scale(const float factor);
 };
 
 /**
@@ -234,6 +234,7 @@ class BoardCircleGrid : public Board
         float spacing = 120.f;
 
         bool is_asymetric = true;
+        Eigen::Vector2i padding_mm;
     };
 
     /**
@@ -255,6 +256,7 @@ class BoardCircleGrid : public Board
     BoardCircleGrid(const Params& params);
 
     std::string_view name() override { return "CircleGridCalibTarget"; }
+    void apply_scale(const float factor) override;
 
    private:
     void init_params(const Params& params);

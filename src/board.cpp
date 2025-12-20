@@ -255,7 +255,8 @@ void BoardCircleGrid::init_params(const Params& params)
     spacing_ = params.spacing;
     is_asymetric_ = params.is_asymetric;
 
-    padding_top_left_ = Eigen::Vector3d(outer_radius_ + 20, outer_radius_ + 15, 0);  // cols, rows
+    padding_top_left_ =
+        Eigen::Vector3d(outer_radius_ + params.padding_mm(0), outer_radius_ + params.padding_mm(1), 0);  // cols, rows
     padding_bottom_right_ = Eigen::Vector3d(0.0, 0, 0);
 
     id_of_coding_ = {0};
@@ -273,6 +274,24 @@ void BoardCircleGrid::setup_markers()
         for (int col = 0; col < cols_; ++col)
         {
             marker_centers_.emplace_back(marker_localization(*this, row, col));
+        }
+    }
+}
+
+void BoardCircleGrid::apply_scale(const float factor)
+{
+    scale_ = factor;
+    outer_radius_ *= factor;
+    spacing_ *= factor;
+    bottom_right_ = (bottom_right_ - padding_top_left_ - padding_bottom_right_) * factor + padding_top_left_ +
+                    padding_bottom_right_;
+
+    for (int row = 0; row < rows_; ++row)
+    {
+        for (int col = 0; col < cols_; ++col)
+        {
+            Eigen::Vector3d& marker = marker_centers_[col + row * cols_];
+            marker = (marker - top_left_) * factor + top_left_;
         }
     }
 }

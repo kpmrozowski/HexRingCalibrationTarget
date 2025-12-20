@@ -144,7 +144,7 @@ void draw_footer(cv::Mat1b &image, const BoardCircleGrid &board, const float mm_
     cv::putText(image, footer,
                 cv::Point(int(0.6 * (board.top_left_(0) - board.outer_radius_) / mm_per_pixel),
                           int(0.6f * (board.top_left_(1) - board.outer_radius_) / mm_per_pixel)),
-                cv::FONT_HERSHEY_COMPLEX, footer_scale, cv::Scalar(0, 0, 0), footer_thickness, cv::LINE_AA, false);
+                cv::FONT_HERSHEY_COMPLEX, footer_scale, cv::Scalar(200, 200, 200), footer_thickness, cv::LINE_AA, false);
 }
 
 }  // namespace
