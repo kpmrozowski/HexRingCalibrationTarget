@@ -19,10 +19,6 @@ void save_inner_markers_and_unique(const cv::Mat1b &image, const std::vector<bas
 void save_marker_identification(const cv::Mat1b &image, const Eigen::Matrix<std::optional<int>, -1, -1> &ordering,
                                 const std::vector<base::MarkerRing> &markers, const int image_idx);
 
-void save_marker_identification(const cv::Mat1b &image, const Eigen::Matrix<std::optional<int>, -1, -1> &ordering,
-                                const std::vector<base::MarkerRing> &markers, const int image_idx,
-                                const std::filesystem::path &output_path);
-
 void save_neighbors_edges(const cv::Mat1b &image, const std::vector<base::MarkerNeighborhood> &neighbors,
                           const std::vector<base::MarkerCoding> &coding, const std::vector<base::MarkerRing> &ring,
                           const int image_idx);

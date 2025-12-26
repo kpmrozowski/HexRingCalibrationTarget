@@ -447,7 +447,7 @@ void save_markers(const std::filesystem::path &output_path, const int image_idx,
         spdlog::warn("image {}: Failed to save markers to {}", image_idx, json_path.string());
     }
 
-    marker::debug::save_marker_identification(input, ordering, rings, image_idx, output_path);
+    marker::debug::save_marker_identification(input, ordering, rings, image_idx);
 }
 
 }  // namespace
@@ -805,13 +805,14 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
     {
         if (!output_path.empty())
         {
+            save_markers(output_path, 99999, total_expected_markers, identified_markers, rings, board, input, ordering);
             save_markers(output_path, image_idx, total_expected_markers, identified_markers, rings, board, input,
                          ordering);
 
             io::debug::save_image(marker_area, std::format("marker_area_circle_{}", image_idx),
-                                  output_path / debug::kMarkersSubdir);
+                                  debug::kMarkersSubdir);
             io::debug::save_image(calibrated_area, std::format("calibrated_area_circle_{}", image_idx),
-                                  output_path / debug::kMarkersSubdir);
+                                  debug::kMarkersSubdir);
         }
     }
 

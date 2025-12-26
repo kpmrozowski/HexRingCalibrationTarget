@@ -31,7 +31,7 @@ Eigen::Vector3d marker_localization(const BoardCircleGrid& board, const int row,
     }
     else
     {  // symmetric grid
-        return board.top_left_ + Eigen::Vector3d(board.spacing_ * row, board.spacing_ * col, 0.0);
+        return board.top_left_ + Eigen::Vector3d(board.spacing_ * col, board.spacing_ * row, 0.0);
     }
 }
 
