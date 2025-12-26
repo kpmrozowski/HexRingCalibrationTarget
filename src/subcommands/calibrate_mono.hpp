@@ -12,6 +12,7 @@ class CalibrateMono : public utils::Subcommand
     std::vector<float> board_params_vec_;
     std::string camera_id_;
     int board_type_ = 0;
+    int start_idx_ = 0;
 
    public:
     std::string name() const override { return "CalibrateMono"; }
@@ -27,6 +28,7 @@ class CalibrateMono : public utils::Subcommand
         cmd.add_option("--board-params-path", board_params_path_, "Path to board parameters json.")
             ->check(CLI::ExistingFile);
         add_board(cmd, board_type_);
+        cmd.add_option("--start-idx", start_idx_, "First image idx.");
     }
 
     void execute() override;

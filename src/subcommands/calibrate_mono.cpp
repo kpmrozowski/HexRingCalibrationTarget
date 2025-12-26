@@ -15,7 +15,7 @@ void CalibrateMono::execute()
 {
     std::map<int, base::ImageDecoding> decoded;
 
-    ImageFilesDataset images_set(dataset_folder_, camera_id_);
+    ImageFilesDataset images_set(dataset_folder_, camera_id_, start_idx_);
     const auto data_container = images_set();
 
     const std::unique_ptr<Board> calibration_board = !board_params_vec_.empty()
@@ -39,7 +39,7 @@ void CalibrateMono::execute()
                     mat,
                     marker::DetectionParameters(650.0, circle_board->outer_radius_ * 2,
                                                 circle_board->outer_radius_ * 2, 100.0, 1000.0),
-                    *circle_board, tracker_state, image_id);
+                    *circle_board, tracker_state, image_id, output_folder_);
             }
             else
             {

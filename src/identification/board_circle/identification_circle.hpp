@@ -24,18 +24,6 @@ struct TrackingState
 };
 
 /**
- * @brief Primary identification using OpenCV's findCirclesGrid
- *
- * @param image Input grayscale image
- * @param coding_markers Detected coding markers (full black circles)
- * @param board Board definition with rows, cols, and asymmetric flag
- * @return Vector of global IDs for each marker, or nullopt if detection fails
- */
-std::optional<std::vector<int>> identify_with_findCirclesGrid(const cv::Mat1b& image,
-                                                               const std::vector<base::MarkerCoding>& coding_markers,
-                                                               const BoardCircleGrid& board);
-
-/**
  * @brief Fallback identification using frame-to-frame tracking with KNN + RANSAC
  *
  * @param prev_markers Markers detected in previous frame
@@ -46,9 +34,9 @@ std::optional<std::vector<int>> identify_with_findCirclesGrid(const cv::Mat1b& i
  * @return Vector of global IDs for current markers, or nullopt if tracking fails
  */
 std::optional<std::vector<int>> identify_with_tracking(const std::vector<base::MarkerCoding>& prev_markers,
-                                                        const std::vector<base::MarkerCoding>& curr_markers,
-                                                        const std::vector<int>& prev_ids, float distance_threshold,
-                                                        float ransac_threshold);
+                                                       const std::vector<base::MarkerCoding>& curr_markers,
+                                                       const std::vector<int>& prev_ids, float distance_threshold,
+                                                       float ransac_threshold);
 
 /**
  * @brief Identify new markers by fitting lines through identified markers in each row
@@ -61,5 +49,16 @@ std::optional<std::vector<int>> identify_with_tracking(const std::vector<base::M
  * @param board Board definition
  */
 void identify_new_markers_by_row_lines(std::vector<base::MarkerRing>& markers, const BoardCircleGrid& board);
+
+/**
+ * @brief Tests if the detected markers can form a valid grid pattern using findCirclesGrid.
+ *
+ * @param indices global indices for each coding marker
+ * @param coding_markers Detected coding markers
+ * @param board Board definition
+ * @return true if findCirclesGrid successfully detects the full pattern
+ */
+bool test_find_circles_grid(std::vector<int>& indices, const std::vector<base::MarkerCoding>& coding_markers,
+                            const BoardCircleGrid& board);
 
 }  // namespace identification::circlegrid

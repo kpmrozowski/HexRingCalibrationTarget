@@ -21,10 +21,18 @@ bool ImageFilesDataset::read_images_filenames(std::vector<ImageFileDescriptor>& 
             const auto match = ImageFileDescriptor::match_filepath(entry, regex);
             if (match.first.size() == 3 && camera_key_ == match.first[1])
             {
-                result.emplace_back(entry, std::stoi(match.first[2]), view_current_type());
+                const int idx = std::stoi(match.first[2]);
+                if (idx < start_idx_) {
+                    continue;
+                }
+                result.emplace_back(entry, idx, view_current_type());
             }
             else if (match.first.size() == 3 && camera_key_ == match.first[2])
             {
+                const int idx = std::stoi(match.first[1]);
+                if (idx < start_idx_) {
+                    continue;
+                }
                 result.emplace_back(entry, std::stoi(match.first[1]), view_current_type());
             }
         }

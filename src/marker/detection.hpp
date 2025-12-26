@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <optional>
 
 #include "board.hpp"
@@ -20,6 +21,7 @@ std::optional<base::ImageDecoding> detect_and_identify(cv::Mat1b &input, const D
 
 std::optional<base::ImageDecoding> detect_and_identify_circlegrid(
     cv::Mat1b &input, const DetectionParameters &parameters, const BoardCircleGrid &board,
-    identification::circlegrid::TrackingState &tracker_state, const int image_idx);
+    identification::circlegrid::TrackingState &tracker_state, const int image_idx,
+    const std::filesystem::path &output_path = {});
 
 }  // namespace marker::detection

@@ -5,14 +5,17 @@
 #include <limits>
 #include <map>
 
+#include <spdlog/spdlog.h>
 #include <Eigen/Core>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/imgproc.hpp>
-#include <spdlog/spdlog.h>
 
-namespace identification::circlegrid::detail
+namespace
 {
+
+
+
 /**
  * @brief Custom blob detector that returns pre-detected keypoints.
  *        This allows us to use findCirclesGrid with our own marker detection.
@@ -20,10 +23,10 @@ namespace identification::circlegrid::detail
 class PredetectedBlobDetector : public cv::Feature2D
 {
    public:
-    explicit PredetectedBlobDetector(const std::vector<cv::KeyPoint> &keypoints) : keypoints_(keypoints) {}
+    explicit PredetectedBlobDetector(const std::vector<cv::KeyPoint>& keypoints) : keypoints_(keypoints) {}
     ~PredetectedBlobDetector() override = default;
 
-    void detect(cv::InputArray, std::vector<cv::KeyPoint> &keypoints, cv::InputArray = cv::noArray()) override
+    void detect(cv::InputArray, std::vector<cv::KeyPoint>& keypoints, cv::InputArray = cv::noArray()) override
     {
         keypoints = keypoints_;
     }
@@ -31,10 +34,42 @@ class PredetectedBlobDetector : public cv::Feature2D
    private:
     std::vector<cv::KeyPoint> keypoints_;
 };
+
+using RowIdx = int;
+using MarkerIdx = int;
+
+struct RowInfo
+{
+    bool is_complete;
+    Eigen::Vector2f direction;
+    Eigen::Vector2f point_on_line;
+    std::vector<MarkerIdx> marker_indices;
+    std::optional<float> mean_spacing;
+};
+
+/**
+ * @brief The function try to find missing in row_infos rows. It does that by searching the correspondance between
+ *        the markers from all_markers vector and their rows. The rows which markers were found on previous frame
+ *        in number at least 2 per row are detected, so has their global_id set correctly and are listed in
+ *        RowInfo::marker_indices and RowInfo::is_complete is true. But markers which were not found on previous frame
+ *        have their global_id==-1 and are not present in RowInfo::marker_indices, so they are gonna be found here.
+ *        In the other hand markers which were found on previous frame but are in less number then two markers per
+ *        one line are present on RowInfo::marker_indices but their RowInfo::is_complete is false, so they will be tried
+ *        to be found first.
+ * 
+ * @param row_infos partial data about detected markers and their current rows correspondance
+ * @param all_markers markers that were detected on current frame. Those which have been detected on previous frame has
+ *        their global_id different then -1.
+ */
+void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vector<base::MarkerRing>& all_markers) {
+}
+
 }  // namespace identification::circlegrid::detail
 
-namespace identification::circlegrid
+namespace identification
 {
+
+using circlegrid::TrackingState;
 
 void TrackingState::update(const std::vector<base::MarkerCoding>& markers, const std::vector<int>& global_ids)
 {
@@ -50,203 +85,37 @@ void TrackingState::clear()
     has_previous_ = false;
 }
 
-std::optional<std::vector<int>> identify_with_findCirclesGrid(const cv::Mat1b& image,
-                                                               const std::vector<base::MarkerCoding>& coding_markers,
-                                                               const BoardCircleGrid& board)
+std::optional<std::vector<int>> circlegrid::identify_with_tracking(const std::vector<base::MarkerCoding>& prev_markers,
+                                                                   const std::vector<base::MarkerCoding>& curr_markers,
+                                                                   const std::vector<int>& prev_ids,
+                                                                   float distance_threshold, float ransac_threshold)
 {
-    // Simple geometric identification:
-    // 1. Sort markers by row (y-coordinate)
-    // 2. Group markers into rows
-    // 3. Within each row, sort by column (x-coordinate)
-    // 4. Assign IDs based on grid position
-    // 5. Handle extra markers by keeping only the expected number per row
+    spdlog::debug("identify_with_tracking: prev={}, curr={}", prev_markers.size(), curr_markers.size());
 
-    if (coding_markers.size() < static_cast<size_t>(board.rows_ * board.cols_))
-    {
-        spdlog::debug("Not enough markers for geometric identification: {} < {}", coding_markers.size(),
-                      board.rows_ * board.cols_);
-        return std::nullopt;
-    }
-
-    // Create index pairs for sorting (index, marker)
-    std::vector<std::pair<int, const base::MarkerCoding*>> indexed_markers;
-    indexed_markers.reserve(coding_markers.size());
-    for (size_t i = 0; i < coding_markers.size(); ++i)
-    {
-        indexed_markers.emplace_back(static_cast<int>(i), &coding_markers[i]);
-    }
-
-    // Sort by row (y-coordinate)
-    std::sort(indexed_markers.begin(), indexed_markers.end(),
-              [](const auto& a, const auto& b) { return a.second->row_ < b.second->row_; });
-
-    // Calculate gaps between consecutive y-coordinates
-    std::vector<std::pair<float, size_t>> gaps;  // (gap_size, index_after_gap)
-    for (size_t i = 1; i < indexed_markers.size(); ++i)
-    {
-        const float gap = indexed_markers[i].second->row_ - indexed_markers[i - 1].second->row_;
-        gaps.emplace_back(gap, i);
-    }
-
-    // Sort gaps by size (descending) and take the (board.rows_ - 1) largest gaps as row separators
-    std::sort(gaps.begin(), gaps.end(),
-              [](const auto& a, const auto& b) { return a.first > b.first; });
-
-    // Extract the indices where we should split into new rows
-    std::vector<size_t> split_indices;
-    const size_t num_row_gaps = static_cast<size_t>(board.rows_ - 1);
-    for (size_t i = 0; i < std::min(num_row_gaps, gaps.size()); ++i)
-    {
-        split_indices.push_back(gaps[i].second);
-    }
-    std::sort(split_indices.begin(), split_indices.end());
-
-    // Group into rows using the split indices
-    std::vector<std::vector<std::pair<int, const base::MarkerCoding*>>> rows;
-    rows.emplace_back();
-    size_t split_idx = 0;
-
-    for (size_t i = 0; i < indexed_markers.size(); ++i)
-    {
-        if (split_idx < split_indices.size() && i == split_indices[split_idx])
-        {
-            rows.emplace_back();
-            ++split_idx;
-        }
-        rows.back().emplace_back(indexed_markers[i]);
-    }
-
-    // Check if we have the expected number of rows
-    if (static_cast<int>(rows.size()) != board.rows_)
-    {
-        spdlog::debug("Geometric identification: wrong number of rows {} vs expected {}", rows.size(), board.rows_);
-        // Log row sizes for debugging
-        for (size_t i = 0; i < rows.size(); ++i)
-        {
-            spdlog::debug("  Row {}: {} markers", i, rows[i].size());
-        }
-        return std::nullopt;
-    }
-
-    // Sort each row by x-coordinate
-    for (auto& row : rows)
-    {
-        std::sort(row.begin(), row.end(),
-                  [](const auto& a, const auto& b) { return a.second->col_ < b.second->col_; });
-    }
-
-    // Validate and trim rows - each row should have at least board.cols_ markers
-    // If a row has more markers, remove outliers based on spacing
-    for (auto& row : rows)
-    {
-        if (static_cast<int>(row.size()) < board.cols_)
-        {
-            spdlog::debug("Geometric identification: row has too few markers {} < {}", row.size(), board.cols_);
-            return std::nullopt;
-        }
-
-        // If row has extra markers, find and remove outliers
-        while (static_cast<int>(row.size()) > board.cols_)
-        {
-            // Calculate spacing between adjacent markers
-            std::vector<float> spacings;
-            for (size_t i = 1; i < row.size(); ++i)
-            {
-                spacings.push_back(row[i].second->col_ - row[i - 1].second->col_);
-            }
-
-            // Find the median spacing
-            std::vector<float> sorted_spacings = spacings;
-            std::sort(sorted_spacings.begin(), sorted_spacings.end());
-            const float median_spacing = sorted_spacings[sorted_spacings.size() / 2];
-
-            // Find the marker pair with the smallest spacing (likely the outlier is one of them)
-            size_t min_spacing_idx = 0;
-            float min_spacing = spacings[0];
-            for (size_t i = 1; i < spacings.size(); ++i)
-            {
-                if (spacings[i] < min_spacing)
-                {
-                    min_spacing = spacings[i];
-                    min_spacing_idx = i;
-                }
-            }
-
-            // Remove the marker that makes the spacing more consistent
-            // If it's at the start or end, remove the boundary marker
-            // Otherwise, remove the one that creates a larger gap
-            if (min_spacing_idx == 0)
-            {
-                row.erase(row.begin());
-            }
-            else if (min_spacing_idx == spacings.size() - 1)
-            {
-                row.pop_back();
-            }
-            else
-            {
-                // Remove the marker that is closer to its neighbor
-                const float left_gap = spacings[min_spacing_idx - 1];
-                const float right_gap = spacings[min_spacing_idx + 1];
-                if (left_gap < right_gap)
-                {
-                    row.erase(row.begin() + static_cast<long>(min_spacing_idx));
-                }
-                else
-                {
-                    row.erase(row.begin() + static_cast<long>(min_spacing_idx) + 1);
-                }
-            }
-        }
-    }
-
-    // Assign global IDs
-    std::vector<int> global_ids(coding_markers.size(), -1);
-
-    for (int row_idx = 0; row_idx < static_cast<int>(rows.size()); ++row_idx)
-    {
-        for (int col_idx = 0; col_idx < static_cast<int>(rows[row_idx].size()); ++col_idx)
-        {
-            const int marker_idx = rows[row_idx][col_idx].first;
-            const int global_id = board.row_and_col_to_id(row_idx, col_idx);
-            global_ids[marker_idx] = global_id;
-        }
-    }
-
-    const int identified_count =
-        static_cast<int>(std::count_if(global_ids.begin(), global_ids.end(), [](int id) { return id >= 0; }));
-    spdlog::debug("Geometric identification: assigned {} IDs", identified_count);
-
-    return global_ids;
-}
-
-std::optional<std::vector<int>> identify_with_tracking(const std::vector<base::MarkerCoding>& prev_markers,
-                                                        const std::vector<base::MarkerCoding>& curr_markers,
-                                                        const std::vector<int>& prev_ids, float distance_threshold,
-                                                        float ransac_threshold)
-{
     if (prev_markers.empty() || curr_markers.empty())
     {
         return std::nullopt;
     }
 
-    cv::Mat prev_pts(static_cast<int>(prev_markers.size()), 2, CV_32F);
-    cv::Mat curr_pts(static_cast<int>(curr_markers.size()), 2, CV_32F);
+    cv::Mat prev_pts(int(prev_markers.size()), 2, CV_32F);
+    cv::Mat curr_pts(int(curr_markers.size()), 2, CV_32F);
 
-    for (size_t i = 0; i < prev_markers.size(); ++i)
+    for (size_t idx = 0; idx < prev_markers.size(); ++idx)
     {
-        prev_pts.at<float>(static_cast<int>(i), 0) = prev_markers[i].col_;
-        prev_pts.at<float>(static_cast<int>(i), 1) = prev_markers[i].row_;
+        prev_pts.at<float>(int(idx), 0) = prev_markers[idx].col_;
+        prev_pts.at<float>(int(idx), 1) = prev_markers[idx].row_;
     }
-    for (size_t i = 0; i < curr_markers.size(); ++i)
+    for (size_t idx = 0; idx < curr_markers.size(); ++idx)
     {
-        curr_pts.at<float>(static_cast<int>(i), 0) = curr_markers[i].col_;
-        curr_pts.at<float>(static_cast<int>(i), 1) = curr_markers[i].row_;
+        curr_pts.at<float>(int(idx), 0) = curr_markers[idx].col_;
+        curr_pts.at<float>(int(idx), 1) = curr_markers[idx].row_;
     }
 
+    spdlog::debug("identify_with_tracking: starting KNN match");
     cv::BFMatcher matcher(cv::NORM_L2);
     std::vector<std::vector<cv::DMatch>> knn_matches;
     matcher.knnMatch(curr_pts, prev_pts, knn_matches, 2);
+    spdlog::debug("identify_with_tracking: KNN match done, {} matches", knn_matches.size());
 
     std::vector<cv::Point2f> src_pts, dst_pts;
     std::vector<std::pair<int, int>> correspondences;
@@ -285,8 +154,10 @@ std::optional<std::vector<int>> identify_with_tracking(const std::vector<base::M
         return std::nullopt;
     }
 
+    spdlog::debug("identify_with_tracking: starting RANSAC with {} correspondences", correspondences.size());
     std::vector<uchar> inlier_mask;
     const cv::Mat H = cv::findHomography(src_pts, dst_pts, cv::RANSAC, ransac_threshold, inlier_mask);
+    spdlog::debug("identify_with_tracking: RANSAC done");
 
     if (H.empty())
     {
@@ -316,38 +187,29 @@ std::optional<std::vector<int>> identify_with_tracking(const std::vector<base::M
     return global_ids;
 }
 
-void identify_new_markers_by_row_lines(std::vector<base::MarkerRing>& markers, const BoardCircleGrid& board)
+void circlegrid::identify_new_markers_by_row_lines(std::vector<base::MarkerRing>& markers, const BoardCircleGrid& board)
 {
-    std::map<int, std::vector<int>> row_to_indices;
-    for (size_t i = 0; i < markers.size(); ++i)
+    std::map<RowIdx, RowInfo> row_infos;
+    for (size_t marker_idx = 0; marker_idx < markers.size(); ++marker_idx)
     {
-        if (markers[i].global_id_ < 0)
+        if (markers[marker_idx].global_id_ < 0)
         {
             continue;
         }
-        const int row = board.id_to_row_and_col(markers[i].global_id_)(0);
-        row_to_indices[row].push_back(static_cast<int>(i));
+        const RowIdx row = board.id_to_row_and_col(markers[marker_idx].global_id_)(0);
+        row_infos[row].marker_indices.push_back(static_cast<MarkerIdx>(marker_idx));
     }
 
-    struct RowInfo
+    for (auto& [row_idx, row_info] : row_infos)
     {
-        int row_id;
-        Eigen::Vector2f direction;
-        Eigen::Vector2f point_on_line;
-        float mean_spacing;
-        std::vector<int> marker_indices;
-    };
-    std::vector<RowInfo> row_infos;
-
-    for (const auto& [row_id, indices] : row_to_indices)
-    {
-        if (indices.size() < 2)
+        if (row_info.marker_indices.size() < 2)
         {
             continue;
         }
 
         std::vector<std::pair<float, int>> sorted;
-        for (const int idx : indices)
+
+        for (const MarkerIdx idx : row_info.marker_indices)
         {
             sorted.emplace_back(markers[idx].col_, idx);
         }
@@ -363,35 +225,39 @@ void identify_new_markers_by_row_lines(std::vector<base::MarkerRing>& markers, c
         {
             continue;
         }
+        row_info.point_on_line = p1;
+        row_info.direction = (p2 - p1) / length;
 
-        const Eigen::Vector2f dir = (p2 - p1) / length;
-
-        float total_dist = 0;
+        float total_dist = 0.f;
         for (size_t i = 1; i < sorted.size(); ++i)
         {
-            const int prev = sorted[i - 1].second;
-            const int curr = sorted[i].second;
-            total_dist +=
-                std::hypot(markers[curr].col_ - markers[prev].col_, markers[curr].row_ - markers[prev].row_);
+            const base::MarkerRing& marker_a = markers[sorted[i - 1].second];
+            const base::MarkerRing& marker_b = markers[sorted[i].second];
+            if (std::abs(marker_a.global_id_ - marker_b.global_id_) != 1)
+            {
+                continue;
+            }
+            total_dist += std::hypot(marker_b.col_ - marker_a.col_, marker_b.row_ - marker_a.row_);
         }
-        const float mean_spacing = total_dist / static_cast<float>(sorted.size() - 1);
+        if (total_dist > 1e-6f)
+        {
+            row_info.mean_spacing.emplace(total_dist / static_cast<float>(sorted.size() - 1));
+        }
 
-        RowInfo ri;
-        ri.row_id = row_id;
-        ri.direction = dir;
-        ri.point_on_line = p1;
-        ri.mean_spacing = mean_spacing;
+        row_info.marker_indices.clear();
         for (const auto& [col, idx] : sorted)
         {
-            ri.marker_indices.push_back(idx);
+            row_info.marker_indices.push_back(idx);
         }
-        row_infos.push_back(ri);
+        row_info.is_complete = true;
     }
 
     if (row_infos.empty())
     {
         return;
     }
+
+    try_fill_missing_rows(row_infos, markers);
 
     constexpr float kLineDistanceThreshold = 10.0f;
 
@@ -404,20 +270,20 @@ void identify_new_markers_by_row_lines(std::vector<base::MarkerRing>& markers, c
 
         const Eigen::Vector2f pos(marker.col_, marker.row_);
         float min_dist = kLineDistanceThreshold;
-        const RowInfo* closest_row = nullptr;
+        RowIdx closest_row = -1;
 
-        for (const auto& ri : row_infos)
+        for (const auto& [row, ri] : row_infos)
         {
             const Eigen::Vector2f v = pos - ri.point_on_line;
             const float dist = std::abs(v.x() * (-ri.direction.y()) + v.y() * ri.direction.x());
             if (dist < min_dist)
             {
                 min_dist = dist;
-                closest_row = &ri;
+                closest_row = row;
             }
         }
 
-        if (closest_row == nullptr)
+        if (closest_row == -1)
         {
             continue;
         }
@@ -425,7 +291,7 @@ void identify_new_markers_by_row_lines(std::vector<base::MarkerRing>& markers, c
         float min_marker_dist = std::numeric_limits<float>::max();
         int closest_marker_idx = -1;
 
-        for (const int idx : closest_row->marker_indices)
+        for (const int idx : row_infos[closest_row].marker_indices)
         {
             const float dist = std::hypot(marker.col_ - markers[idx].col_, marker.row_ - markers[idx].row_);
             if (dist < min_marker_dist)
@@ -435,12 +301,12 @@ void identify_new_markers_by_row_lines(std::vector<base::MarkerRing>& markers, c
             }
         }
 
-        if (closest_marker_idx < 0 || closest_row->mean_spacing < 1e-6f)
+        if (closest_marker_idx < 0 || row_infos[closest_row].mean_spacing < 1e-6f)
         {
             continue;
         }
 
-        const int col_offset = static_cast<int>(std::round(min_marker_dist / closest_row->mean_spacing));
+        const int col_offset = static_cast<int>(std::round(min_marker_dist / row_infos[closest_row].mean_spacing.value()));
         if (col_offset == 0)
         {
             continue;
@@ -452,11 +318,76 @@ void identify_new_markers_by_row_lines(std::vector<base::MarkerRing>& markers, c
 
         if (new_col >= 0 && new_col < board.cols_)
         {
-            marker.global_id_ = board.row_and_col_to_id(closest_row->row_id, new_col);
+            marker.global_id_ = board.row_and_col_to_id(closest_row, new_col);
             spdlog::debug("Row-line identification: assigned marker at ({}, {}) to row={}, col={}", marker.row_,
-                          marker.col_, closest_row->row_id, new_col);
+                          marker.col_, closest_row, new_col);
         }
     }
 }
 
-}  // namespace identification::circlegrid
+bool circlegrid::test_find_circles_grid(std::vector<int>& indices,
+                                        const std::vector<base::MarkerCoding>& coding_markers,
+                                        const BoardCircleGrid& board)
+{
+    const size_t total_expected_markers = board.rows_ * board.cols_;
+    if (coding_markers.size() < total_expected_markers)
+    {
+        return false;
+    }
+
+    // Convert markers to keypoints
+    std::vector<cv::KeyPoint> keypoints;
+    keypoints.reserve(coding_markers.size());
+    for (const auto& marker : coding_markers)
+    {
+        const float size = static_cast<float>(marker.width_ring_ + marker.height_ring_) / 2.0f;
+        keypoints.emplace_back(cv::Point2f(marker.col_, marker.row_), size);
+    }
+
+    // Create a dummy image (findCirclesGrid needs an image for size info)
+    cv::Mat1b dummy_image = cv::Mat1b::zeros(1, 1);
+
+    // Create a blob detector that returns our pre-detected keypoints
+    cv::Ptr<cv::Feature2D> blob_detector = cv::makePtr<PredetectedBlobDetector>(keypoints);
+
+    const cv::Size pattern_size(board.cols_, board.rows_);
+    std::vector<cv::Point2f> centers;
+    int flags = board.is_asymetric_ ? cv::CALIB_CB_ASYMMETRIC_GRID : cv::CALIB_CB_SYMMETRIC_GRID;
+    flags |= cv::CALIB_CB_CLUSTERING;  // Use clustering algorithm which works better with pre-detected points
+
+    const bool success = cv::findCirclesGrid(dummy_image, pattern_size, centers, flags, blob_detector);
+    if (success)
+    {
+        indices.clear();
+        for (size_t idx_marker = 0; idx_marker < coding_markers.size(); ++idx_marker)
+        {
+            bool found = false;
+            const base::MarkerCoding& marker = coding_markers[idx_marker];
+            for (size_t idx_center = 0; idx_center < centers.size(); ++idx_center)
+            {
+                const cv::Point2f& center = centers[idx_center];
+                if (found = marker.row_ == center.y && marker.col_ == center.x; found)
+                {
+                    indices.push_back(int(idx_center));
+                    break;
+                }
+            }
+
+            if (!found)
+            {
+                spdlog::warn("Center id {} ({:0.1f}, {:0.1f}) was not identified!", idx_marker, marker.col_,
+                             marker.row_);
+            }
+        }
+
+        if (total_expected_markers != indices.size())
+        {
+            throw std::runtime_error(
+                std::format("Identified {} markers of {}!", indices.size(), total_expected_markers));
+        }
+    }
+
+    return success;
+}
+
+}  // namespace identification

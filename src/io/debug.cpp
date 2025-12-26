@@ -33,6 +33,16 @@ void debug::save_image(const cv::Mat& image, const std::filesystem::path& name, 
     cv::imwrite(full_filepath.string(), image);
 }
 
+void debug::save_image_to(const cv::Mat& image, const std::filesystem::path& name, const std::filesystem::path& output_path)
+{
+    std::filesystem::create_directories(output_path);
+
+    std::filesystem::path full_filepath = (output_path / name);
+    full_filepath.replace_extension(kMatTypeToExtension.at(image.type()));
+
+    cv::imwrite(full_filepath.string(), image);
+}
+
 void debug::save_json(const nlohmann::json& json, std::filesystem::path name, const std::filesystem::path& subdir)
 {
     const std::filesystem::path dir_path = debug_save_path() / subdir;
