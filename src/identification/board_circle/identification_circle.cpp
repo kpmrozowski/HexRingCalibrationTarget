@@ -11,6 +11,7 @@
 #include <opencv2/calib3d.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/imgproc.hpp>
+#include "constants.hpp"
 
 namespace
 {
@@ -86,7 +87,7 @@ struct RowInfo
 void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vector<MarkerIdx>& unindentified_indices,
                            std::vector<base::MarkerRing>& all_markers, const BoardCircleGrid& board)
 {
-    constexpr float kLineDistanceTolerance = 15.0f;
+    constexpr float kLineDistanceTolerance = 5.0f;
 
     // Track which unidentified markers have been assigned
     std::set<MarkerIdx> assigned_markers;
@@ -179,24 +180,53 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
             // Use row's mean_spacing if available, otherwise use global mean spacing
             const float spacing = row_info.mean_spacing.value_or(global_mean_spacing);
 
-            if (closest_marker_idx >= 0 && spacing > 1e-6f)
+            if (closest_marker_idx < 0 || spacing < 1e-6f)
             {
-                const int col_offset = static_cast<int>(std::round(min_marker_dist / spacing));
-                if (col_offset > 0)
-                {
-                    const float direction = (marker.col_ > all_markers[closest_marker_idx].col_) ? 1.0f : -1.0f;
-                    const int ref_col = board.id_to_row_and_col(all_markers[closest_marker_idx].global_id_)(1);
-                    const int new_col = ref_col + static_cast<int>(direction * static_cast<float>(col_offset));
+                continue;
+            }
 
-                    if (new_col >= 0 && new_col < board.cols_)
+            const int col_offset = static_cast<int>(std::round(min_marker_dist / spacing));
+            if (col_offset < 1)
+            {
+                continue;
+            }
+            const float direction = (marker.col_ > all_markers[closest_marker_idx].col_) ? 1.0f : -1.0f;
+            const int ref_col = board.id_to_row_and_col(all_markers[closest_marker_idx].global_id_)(1);
+            const int new_col = ref_col + static_cast<int>(direction * static_cast<float>(col_offset));
+
+            if (new_col < 0 || new_col >= board.cols_)
+            {
+                continue;
+            }
+
+            // Geometric check: verify the direction from reference marker to unidentified marker
+            // aligns with the row direction. If mostly perpendicular, the reference is likely
+            // in a different row and shouldn't be used for column calculation.
+            if (row_info.direction.has_value())
+            {
+                const Eigen::Vector2f ref_to_marker(marker.col_ - all_markers[closest_marker_idx].col_,
+                                                    marker.row_ - all_markers[closest_marker_idx].row_);
+                const float ref_to_marker_len = ref_to_marker.norm();
+                if (ref_to_marker_len > 1e-6f)
+                {
+                    const Eigen::Vector2f ref_to_marker_dir = ref_to_marker / ref_to_marker_len;
+                    const float alignment = std::abs(ref_to_marker_dir.dot(row_info.direction.value()));
+                    const float kMinAlignment = std::cos(10 / 180.f * pi);  // cos(10 deg) ~ 0.9848
+                    if (alignment < kMinAlignment)
                     {
-                        all_markers[marker_idx].global_id_ = board.row_and_col_to_id(best_row, new_col);
-                        row_infos[best_row].marker_indices.push_back(marker_idx);
-                        assigned_markers.insert(marker_idx);
-                        spdlog::debug("Stage1: Assigned marker {} to row={}, col={}", marker_idx, best_row, new_col);
+                        spdlog::debug("Stage1: Skipping marker {} - direction alignment {:.2f} < {:.2f}", marker_idx,
+                                      alignment, kMinAlignment);
+                        continue;
                     }
                 }
             }
+
+            const int new_global_id = board.row_and_col_to_id(best_row, new_col);
+
+            all_markers[marker_idx].global_id_ = new_global_id;
+            row_infos[best_row].marker_indices.push_back(marker_idx);
+            assigned_markers.insert(marker_idx);
+            spdlog::debug("Stage1: Assigned marker {} to row={}, col={}", marker_idx, best_row, new_col);
         }
     }
 
@@ -436,7 +466,8 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
 
     // Helper lambda to compute column positions for a given parity
     auto compute_col_positions = [&](const std::map<int, std::vector<MarkerIdx>>& markers_by_col)
-        -> std::tuple<std::vector<std::pair<float, int>>, Eigen::Vector2f, float> {
+        -> std::tuple<std::vector<std::pair<float, int>>, Eigen::Vector2f, float>
+    {
         if (markers_by_col.empty())
         {
             return {{}, Eigen::Vector2f::Zero(), 0.f};
@@ -470,8 +501,7 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
             const int col_diff = std::abs(col_positions[i].second - col_positions[i - 1].second);
             if (col_diff > 0)
             {
-                total_spacing +=
-                    (col_positions[i].first - col_positions[i - 1].first) / static_cast<float>(col_diff);
+                total_spacing += (col_positions[i].first - col_positions[i - 1].first) / static_cast<float>(col_diff);
                 ++spacing_count;
             }
         }
@@ -589,6 +619,10 @@ std::optional<std::vector<int>> circlegrid::identify_with_tracking(const std::ve
         curr_pts.at<float>(int(idx), 0) = curr_markers[idx].col_;
         curr_pts.at<float>(int(idx), 1) = curr_markers[idx].row_;
     }
+    if (curr_markers.size() > prev_markers.size())
+    {
+        cv::swap(prev_pts, curr_pts);
+    }
 
     spdlog::debug("identify_with_tracking: starting KNN match");
     cv::BFMatcher matcher(cv::NORM_L2);
@@ -599,7 +633,7 @@ std::optional<std::vector<int>> circlegrid::identify_with_tracking(const std::ve
     std::vector<cv::Point2f> src_pts, dst_pts;
     std::vector<std::pair<int, int>> correspondences;
 
-    constexpr float kRatioThreshold = 0.75f;
+    constexpr float kRatioThreshold = 0.9f;
 
     for (size_t i = 0; i < knn_matches.size(); ++i)
     {
@@ -611,19 +645,28 @@ std::optional<std::vector<int>> circlegrid::identify_with_tracking(const std::ve
         const auto& best = knn_matches[i][0];
         const auto& second = knn_matches[i][1];
 
-        if (best.distance > kRatioThreshold * second.distance)
-        {
-            continue;
-        }
+        // if (best.distance > kRatioThreshold * second.distance)
+        // {
+        //     continue;
+        // }
 
         if (best.distance > distance_threshold)
         {
             continue;
         }
 
-        src_pts.emplace_back(curr_markers[i].col_, curr_markers[i].row_);
-        dst_pts.emplace_back(prev_markers[best.trainIdx].col_, prev_markers[best.trainIdx].row_);
-        correspondences.emplace_back(best.trainIdx, static_cast<int>(i));
+        if (curr_markers.size() > prev_markers.size())
+        {
+            src_pts.emplace_back(curr_markers.at(best.trainIdx).col_, curr_markers.at(best.trainIdx).row_);
+            dst_pts.emplace_back(prev_markers.at(i).col_, prev_markers.at(i).row_);
+            correspondences.emplace_back(static_cast<int>(i), best.trainIdx);
+        }
+        else
+        {
+            src_pts.emplace_back(curr_markers.at(i).col_, curr_markers.at(i).row_);
+            dst_pts.emplace_back(prev_markers.at(best.trainIdx).col_, prev_markers.at(best.trainIdx).row_);
+            correspondences.emplace_back(best.trainIdx, static_cast<int>(i));
+        }
     }
 
     constexpr size_t kMinCorrespondences = 4;
@@ -690,13 +733,27 @@ void circlegrid::identify_new_markers_by_row_lines(std::vector<base::MarkerRing>
             row_info.point_on_line = Eigen::Vector2f(markers[idx].col_, markers[idx].row_);
             continue;
         }
+        std::vector<std::pair<float, MarkerIdx>> sorted;
 
-        std::vector<std::pair<float, int>> sorted;
+        // Find the marker with the lowest global_id_ in this row
+        MarkerIdx reference_idx = row_info.marker_indices[0];
+        for (const MarkerIdx idx : row_info.marker_indices)
+        {
+            if (markers[idx].global_id_ < markers[reference_idx].global_id_)
+            {
+                reference_idx = idx;
+            }
+        }
+
+        const Eigen::Vector2f reference_point(markers[reference_idx].col_, markers[reference_idx].row_);
 
         for (const MarkerIdx idx : row_info.marker_indices)
         {
-            sorted.emplace_back(markers[idx].col_, idx);
+            const Eigen::Vector2f point(markers[idx].col_, markers[idx].row_);
+            const float distance = (point - reference_point).norm();
+            sorted.emplace_back(distance, idx);
         }
+
         std::sort(sorted.begin(), sorted.end());
 
         const int first = sorted.front().second;

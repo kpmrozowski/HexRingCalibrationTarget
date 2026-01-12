@@ -634,7 +634,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
             coding_markers_temp.size() >= total_expected_markers &&
             identification::circlegrid::test_find_circles_grid(indices_temp, coding_markers_temp, board);
 
-        spdlog::info("image {}: brightness scale {}: found {} coding markers, findCirclesGrid: {}", image_idx,
+        spdlog::debug("image {}: brightness scale {}: found {} coding markers, findCirclesGrid: {}", image_idx,
                      brightness_scale, coding_markers_temp.size(), find_circles_grid_succeeded ? "PASS" : "FAIL");
 
         // Decide if this result is better than the current best
@@ -694,7 +694,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
         return std::nullopt;
     }
 
-    spdlog::info("image {}: selected brightness scale {} with {} markers (findCirclesGrid: {})", image_idx,
+    spdlog::debug("image {}: selected brightness scale {} with {} markers (findCirclesGrid: {})", image_idx,
                  best_brightness_scale, best_coding_markers.size(), best_find_circles_grid_succeeded ? "PASS" : "FAIL");
 
     input = best_input.clone();
@@ -725,7 +725,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
 
     if (use_tracking && tracker_state.has_previous_)
     {
-        spdlog::info("image {}: Using tracking (reason: {}, markers={}/{})", image_idx,
+        spdlog::debug("image {}: Using tracking (reason: {}, markers={}/{})", image_idx,
                      tracking_mandatory ? "fewer markers" : "identification failed", coding_markers.size(),
                      total_expected_markers);
 
@@ -737,7 +737,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
             global_ids = *tracking_result;
             const int identified_count =
                 static_cast<int>(std::count_if(global_ids.begin(), global_ids.end(), [](int id) { return id >= 0; }));
-            spdlog::info("image {}: Tracking identified {} markers", image_idx, identified_count);
+            spdlog::debug("image {}: Tracking identified {} markers", image_idx, identified_count);
         }
     }
     else if (tracking_mandatory && !tracker_state.has_previous_)
@@ -794,13 +794,14 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
         return std::nullopt;
     }
 
-    spdlog::info("image {}: Final identification: {} / {} markers", image_idx, identified_markers,
+    spdlog::debug("image {}: Final identification: {} / {} markers", image_idx, identified_markers,
                  total_expected_markers);
 
     const cv::Mat1b marker_area = create_marker_area(rings, input.rows, input.cols);
     const cv::Mat1b calibrated_area =
         create_calibrated_area(rings, std::make_unique<BoardCircleGrid>(board), input.rows, input.cols);
 
+    spdlog::info("output_path: {}", output_path.string());
     if constexpr (kShowMarkers)
     {
         if (!output_path.empty())
