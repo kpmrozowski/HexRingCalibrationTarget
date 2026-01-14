@@ -40,6 +40,7 @@ target_link_libraries(${LIB_NAME}
     opencv::calib3d
     opencv::imgproc
     opencv::features2d
+    opencv::video
     Eigen3::Eigen
     ceres
     happly

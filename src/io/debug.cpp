@@ -12,7 +12,7 @@ static constexpr std::string_view kGreen("green");
 static constexpr std::string_view kBlue("blue");
 
 const std::unordered_map<int, std::string_view> kMatTypeToExtension{
-    {CV_8UC1, ".png"},   {CV_8UC3, ".png"},   {CV_8UC4, ".png"},   {CV_16UC1, ".tiff"},
+    {CV_8UC1, ".bmp"},   {CV_8UC3, ".bmp"},   {CV_8UC4, ".bmp"},   {CV_16UC1, ".tiff"},
     {CV_16UC3, ".tiff"}, {CV_16SC1, ".tiff"}, {CV_32SC1, ".tiff"}, {CV_32SC3, ".tiff"},
     {CV_32FC1, ".tiff"}, {CV_32FC3, ".tiff"}, {CV_64FC1, ".tiff"}, {CV_64FC3, ".tiff"},
 };
@@ -21,9 +21,10 @@ const std::unordered_map<int, std::string_view> kMatTypeToExtension{
 
 namespace io
 {
-void debug::save_image(const cv::Mat& image, const std::filesystem::path& name, const std::filesystem::path& subdir)
+void debug::save_image(const cv::Mat& image, const std::filesystem::path& name, const std::filesystem::path& subdir,
+                       const std::filesystem::path& root_dir)
 {
-    const std::filesystem::path dir_path = debug_save_path() / subdir;
+    const std::filesystem::path dir_path = root_dir / subdir;
     std::filesystem::create_directories(dir_path);
 
     std::filesystem::path full_filepath = (dir_path / name);
@@ -33,7 +34,8 @@ void debug::save_image(const cv::Mat& image, const std::filesystem::path& name, 
     cv::imwrite(full_filepath.string(), image);
 }
 
-void debug::save_image_to(const cv::Mat& image, const std::filesystem::path& name, const std::filesystem::path& output_path)
+void debug::save_image_to(const cv::Mat& image, const std::filesystem::path& name,
+                          const std::filesystem::path& output_path)
 {
     std::filesystem::create_directories(output_path);
 

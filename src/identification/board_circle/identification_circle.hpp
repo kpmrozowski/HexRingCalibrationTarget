@@ -17,9 +17,11 @@ struct TrackingState
 {
     std::vector<base::MarkerCoding> prev_markers_;
     std::vector<int> prev_global_ids_;
+    cv::Mat1b prev_image_;  // Store previous image for ECC validation
     bool has_previous_ = false;
 
-    void update(const std::vector<base::MarkerCoding>& markers, const std::vector<int>& global_ids);
+    void update(const std::vector<base::MarkerCoding>& markers, const std::vector<int>& global_ids,
+                const cv::Mat1b& image);
     void clear();
 };
 
@@ -60,5 +62,25 @@ void identify_new_markers_by_row_lines(std::vector<base::MarkerRing>& markers, c
  */
 bool test_find_circles_grid(std::vector<int>& indices, const std::vector<base::MarkerCoding>& coding_markers,
                             const BoardCircleGrid& board);
+
+/**
+ * @brief Validates tracking using ECC metric after homography-based alignment.
+ *
+ * When marker count differs significantly between frames, uses BFMatcher correspondences
+ * to compute homography, warps images, and computes ECC to validate alignment.
+ *
+ * @param prev_markers Markers from previous frame
+ * @param curr_markers Markers from current frame
+ * @param prev_image Previous frame image
+ * @param curr_image Current frame image
+ * @param distance_threshold Maximum distance for KNN matching
+ * @param ransac_threshold RANSAC reprojection threshold
+ * @param ecc_threshold Minimum ECC score to consider tracking valid
+ * @return true if tracking alignment is valid (ECC >= threshold)
+ */
+bool validate_tracking_with_ecc(const std::vector<base::MarkerCoding>& prev_markers,
+                                const std::vector<base::MarkerCoding>& curr_markers, const cv::Mat1b& prev_image,
+                                const cv::Mat1b& curr_image, float distance_threshold = 50.0f,
+                                float ransac_threshold = 5.0f, float ecc_threshold = 0.7f);
 
 }  // namespace identification::circlegrid

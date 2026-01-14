@@ -121,7 +121,8 @@ void debug::save_inner_markers_and_unique(const cv::Mat1b &image, const std::vec
 
 void debug::save_marker_identification(const cv::Mat1b &image,
                                        const Eigen::Matrix<std::optional<int>, -1, -1> &ordering,
-                                       const std::vector<base::MarkerRing> &markers, const int image_idx)
+                                       const std::vector<base::MarkerRing> &markers, const int image_idx,
+                                       const std::filesystem::path &output_path)
 {
     cv::Mat3b painted;
     cv::cvtColor(image, painted, cv::COLOR_GRAY2BGR);
@@ -142,7 +143,7 @@ void debug::save_marker_identification(const cv::Mat1b &image,
         }
     }
 
-    io::debug::save_image(painted, std::format("identified_{:05d}", image_idx), kMarkersSubdir);
+    io::debug::save_image(painted, std::format("identified_{:05d}", image_idx), kMarkersSubdir, output_path);
 }
 
 void debug::save_neighbors_edges(const cv::Mat1b &image, const std::vector<base::MarkerNeighborhood> &neighbors,

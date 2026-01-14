@@ -32,13 +32,12 @@ void CalibrateMono::execute()
         {
             if (calibration_board->type_ == BoardType::CIRCLE)
             {
-                const BoardCircleGrid* circle_board =
-                    dynamic_cast<const BoardCircleGrid*>(calibration_board.get());
+                const BoardCircleGrid* circle_board = dynamic_cast<const BoardCircleGrid*>(calibration_board.get());
 
                 return marker::detection::detect_and_identify_circlegrid(
                     mat,
-                    marker::DetectionParameters(650.0, circle_board->outer_radius_ * 2,
-                                                circle_board->outer_radius_ * 2, 100.0, 1000.0),
+                    marker::DetectionParameters(650.0, circle_board->outer_radius_ * 2, circle_board->outer_radius_ * 2,
+                                                100.0, 1000.0),
                     *circle_board, tracker_state, image_id, output_folder_);
             }
             else
@@ -47,7 +46,7 @@ void CalibrateMono::execute()
                     mat,
                     marker::DetectionParameters(650.0, calibration_board->inner_radius_ * 2,
                                                 calibration_board->outer_radius_ * 2, 100.0, 1000.0),
-                    calibration_board, image_id);
+                    calibration_board, image_id, output_folder_);
             }
         }();
 

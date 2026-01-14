@@ -35,17 +35,18 @@ namespace io::debug
  * @param mat cv::Mat to save.
  * @param name Name of the file, without extension (it is decided automatically by our code).
  * @param subdir Optional subdirectory for the created file.
+ * @param root_dir Optional root directory for the created file.
  */
 void save_image(const cv::Mat& image, const std::filesystem::path& name,
-                const std::filesystem::path& subdir = std::filesystem::path());
+                const std::filesystem::path& subdir = std::filesystem::path(),
+                const std::filesystem::path& root_dir = debug_save_path());
 
 /* @brief Saves an image to a custom output path.
  * @param image cv::Mat to save.
  * @param name Name of the file, without extension (it is decided automatically by our code).
  * @param output_path Directory to save the image to.
  */
-void save_image_to(const cv::Mat& image, const std::filesystem::path& name,
-                   const std::filesystem::path& output_path);
+void save_image_to(const cv::Mat& image, const std::filesystem::path& name, const std::filesystem::path& output_path);
 
 /* @brief Saves a json to a file.
  * @param mat cv::Mat to save.

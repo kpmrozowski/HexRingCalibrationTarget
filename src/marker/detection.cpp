@@ -447,7 +447,7 @@ void save_markers(const std::filesystem::path &output_path, const int image_idx,
         spdlog::warn("image {}: Failed to save markers to {}", image_idx, json_path.string());
     }
 
-    marker::debug::save_marker_identification(input, ordering, rings, image_idx);
+    marker::debug::save_marker_identification(input, ordering, rings, image_idx, output_path);
 }
 
 }  // namespace
@@ -457,7 +457,8 @@ namespace marker
 std::optional<base::ImageDecoding> detection::detect_and_identify(cv::Mat1b &input,
                                                                   const DetectionParameters &parameters,
                                                                   const std::unique_ptr<Board> &board,
-                                                                  const int image_idx)
+                                                                  const int image_idx,
+                                                                  const std::filesystem::path &output_path)
 {
     spdlog::debug("detecting markers in image {}", image_idx);
 
@@ -561,7 +562,8 @@ std::optional<base::ImageDecoding> detection::detect_and_identify(cv::Mat1b &inp
 
     if constexpr (kShowMarkers)
     {
-        marker::debug::save_marker_identification(input, decoding->ordering(), decoding->markers, image_idx);
+        marker::debug::save_marker_identification(input, decoding->ordering(), decoding->markers, image_idx,
+                                                  output_path);
     }
 
     const cv::Mat1b marker_area = create_marker_area(decoding->markers, input.rows, input.cols);
@@ -582,6 +584,11 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
     const std::filesystem::path &output_path)
 {
     spdlog::debug("Detecting circle grid markers in image {}", image_idx);
+
+    if (image_idx == 671)
+    {
+        int aa = 5;
+    }
 
     const size_t total_expected_markers = board.rows_ * board.cols_;
 
@@ -635,7 +642,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
             identification::circlegrid::test_find_circles_grid(indices_temp, coding_markers_temp, board);
 
         spdlog::debug("image {}: brightness scale {}: found {} coding markers, findCirclesGrid: {}", image_idx,
-                     brightness_scale, coding_markers_temp.size(), find_circles_grid_succeeded ? "PASS" : "FAIL");
+                      brightness_scale, coding_markers_temp.size(), find_circles_grid_succeeded ? "PASS" : "FAIL");
 
         // Decide if this result is better than the current best
         // Priority:
@@ -686,6 +693,11 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
             best_find_circles_grid_succeeded = find_circles_grid_succeeded;
             best_marker_count = best_coding_markers.size();
         }
+
+        if (find_circles_grid_succeeded)
+        {
+            break;
+        }
     }
 
     if (best_coding_markers.empty())
@@ -695,7 +707,8 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
     }
 
     spdlog::debug("image {}: selected brightness scale {} with {} markers (findCirclesGrid: {})", image_idx,
-                 best_brightness_scale, best_coding_markers.size(), best_find_circles_grid_succeeded ? "PASS" : "FAIL");
+                  best_brightness_scale, best_coding_markers.size(),
+                  best_find_circles_grid_succeeded ? "PASS" : "FAIL");
 
     input = best_input.clone();
     const cv::Mat1b binarized = best_binarized.clone();
@@ -723,11 +736,25 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
         tracking_mandatory || (!primary_succeeded && tracker_state.has_previous_ &&
                                coding_markers.size() > size_t(float(total_expected_markers) * 0.3f));
 
+    // Validate tracking with ECC to detect large jumps/movements that cause incorrect ID assignments
+    // Always validate when tracking is used to catch cases where board moved significantly
+    if (use_tracking && tracker_state.has_previous_)
+    {
+        const bool tracking_valid = identification::circlegrid::validate_tracking_with_ecc(
+            tracker_state.prev_markers_, coding_markers, tracker_state.prev_image_, input, 50.0f, 5.0f, 0.7f);
+
+        if (!tracking_valid)
+        {
+            spdlog::warn("image {}: ECC validation failed, clearing tracking state", image_idx);
+            tracker_state.clear();
+        }
+    }
+
     if (use_tracking && tracker_state.has_previous_)
     {
         spdlog::debug("image {}: Using tracking (reason: {}, markers={}/{})", image_idx,
-                     tracking_mandatory ? "fewer markers" : "identification failed", coding_markers.size(),
-                     total_expected_markers);
+                      tracking_mandatory ? "fewer markers" : "identification failed", coding_markers.size(),
+                      total_expected_markers);
 
         const auto tracking_result = identification::circlegrid::identify_with_tracking(
             tracker_state.prev_markers_, coding_markers, tracker_state.prev_global_ids_, 50.0f, 5.0f);
@@ -746,15 +773,24 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
                      coding_markers.size(), total_expected_markers);
     }
 
+    if (global_ids.empty())
+    {
+        spdlog::warn("image {}: tracking failed", image_idx);
+        return std::nullopt;
+    }
+
+    if (global_ids.size() != coding_markers.size())
+    {
+        throw std::runtime_error(std::format("Not all markers has asigned indices! , global_ids {}, coding_markers {}",
+                                             global_ids.size(), coding_markers.size()));
+    }
+
     std::vector<base::MarkerRing> rings;
     rings.reserve(coding_markers.size());
     for (size_t i = 0; i < coding_markers.size(); ++i)
     {
         rings.emplace_back(coding_markers[i]);
-        if (i < global_ids.size())
-        {
-            rings.back().global_id_ = global_ids[i];
-        }
+        rings.back().global_id_ = global_ids[i];
     }
 
     const size_t prev_count = tracker_state.has_previous_ ? tracker_state.prev_markers_.size() : 0;
@@ -772,7 +808,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
     {
         current_ids.push_back(r.global_id_);
     }
-    tracker_state.update(coding_markers, current_ids);
+    tracker_state.update(coding_markers, current_ids, input);
 
     Eigen::Matrix<std::optional<int>, -1, -1> ordering =
         Eigen::Matrix<std::optional<int>, -1, -1>::Constant(board.rows_, board.cols_, std::nullopt);
@@ -795,7 +831,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
     }
 
     spdlog::debug("image {}: Final identification: {} / {} markers", image_idx, identified_markers,
-                 total_expected_markers);
+                  total_expected_markers);
 
     const cv::Mat1b marker_area = create_marker_area(rings, input.rows, input.cols);
     const cv::Mat1b calibrated_area =
@@ -810,8 +846,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
             save_markers(output_path, image_idx, total_expected_markers, identified_markers, rings, board, input,
                          ordering);
 
-            io::debug::save_image(marker_area, std::format("marker_area_circle_{}", image_idx),
-                                  debug::kMarkersSubdir);
+            io::debug::save_image(marker_area, std::format("marker_area_circle_{}", image_idx), debug::kMarkersSubdir);
             io::debug::save_image(calibrated_area, std::format("calibrated_area_circle_{}", image_idx),
                                   debug::kMarkersSubdir);
         }

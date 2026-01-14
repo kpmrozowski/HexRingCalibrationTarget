@@ -11,6 +11,7 @@
 #include <opencv2/calib3d.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/video.hpp>
 #include "constants.hpp"
 
 namespace
@@ -40,8 +41,8 @@ using MarkerIdx = int;
 
 struct RowInfo
 {
-    std::optional<Eigen::Vector2f> direction;
-    Eigen::Vector2f point_on_line;
+    std::optional<cv::Point2f> direction;
+    cv::Point2f point_on_line;
     std::vector<MarkerIdx> marker_indices;
     std::optional<float> mean_spacing;
 };
@@ -97,7 +98,7 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
     // ===================================================================================
 
     // Compute mean direction and mean spacing from all rows (for fallback)
-    Eigen::Vector2f mean_row_direction = Eigen::Vector2f::Zero();
+    cv::Point2f mean_row_direction;
     float global_mean_spacing = 0.f;
     int spacing_count = 0;
     for (const auto& [row_idx, row_info] : row_infos)
@@ -112,9 +113,9 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
             ++spacing_count;
         }
     }
-    if (mean_row_direction.norm() > 1e-6f)
+    if (const double norm = cv::norm(mean_row_direction); norm > 1e-6)
     {
-        mean_row_direction.normalize();
+        mean_row_direction /= norm;
     }
     if (spacing_count > 0)
     {
@@ -125,7 +126,7 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
     for (const MarkerIdx marker_idx : unindentified_indices)
     {
         const base::MarkerRing& marker = all_markers[marker_idx];
-        const Eigen::Vector2f pos(marker.col_, marker.row_);
+        const cv::Point2f pos(marker.col_, marker.row_);
 
         float min_dist = kLineDistanceTolerance;
         RowIdx best_row = -1;
@@ -133,12 +134,12 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
         for (const auto& [row_idx, row_info] : row_infos)
         {
             // Use row's own direction if available, otherwise use mean direction
-            Eigen::Vector2f dir;
+            cv::Point2f dir;
             if (row_info.direction.has_value())
             {
                 dir = row_info.direction.value();
             }
-            else if (mean_row_direction.norm() > 1e-6f)
+            else if (cv::norm(mean_row_direction) > 1e-6f)
             {
                 dir = mean_row_direction;
             }
@@ -148,8 +149,8 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
             }
 
             // Compute perpendicular distance to line: |v × direction|
-            const Eigen::Vector2f v = pos - row_info.point_on_line;
-            const float dist = std::abs(v.x() * (-dir.y()) + v.y() * dir.x());
+            const cv::Point2f v = pos - row_info.point_on_line;
+            const float dist = std::abs(v.x * (-dir.y) + v.y * dir.x);
 
             if (dist < min_dist)
             {
@@ -204,12 +205,12 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
             // in a different row and shouldn't be used for column calculation.
             if (row_info.direction.has_value())
             {
-                const Eigen::Vector2f ref_to_marker(marker.col_ - all_markers[closest_marker_idx].col_,
-                                                    marker.row_ - all_markers[closest_marker_idx].row_);
-                const float ref_to_marker_len = ref_to_marker.norm();
-                if (ref_to_marker_len > 1e-6f)
+                const cv::Point2f ref_to_marker(marker.col_ - all_markers[closest_marker_idx].col_,
+                                                marker.row_ - all_markers[closest_marker_idx].row_);
+                const double ref_to_marker_len = cv::norm(ref_to_marker);
+                if (ref_to_marker_len > 1e-6)
                 {
-                    const Eigen::Vector2f ref_to_marker_dir = ref_to_marker / ref_to_marker_len;
+                    const cv::Point2f ref_to_marker_dir = ref_to_marker / ref_to_marker_len;
                     const float alignment = std::abs(ref_to_marker_dir.dot(row_info.direction.value()));
                     const float kMinAlignment = std::cos(10 / 180.f * pi);  // cos(10 deg) ~ 0.9848
                     if (alignment < kMinAlignment)
@@ -250,7 +251,7 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
     // ===================================================================================
 
     // Step 2.1: Collect directions of existing rows
-    std::vector<Eigen::Vector2f> row_directions;
+    std::vector<cv::Point2f> row_directions;
     std::vector<RowIdx> rows_with_direction;
     for (const auto& [row_idx, row_info] : row_infos)
     {
@@ -267,16 +268,16 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
     }
 
     // Step 2.2: Compute mean direction and perpendicular
-    Eigen::Vector2f mean_direction = Eigen::Vector2f::Zero();
+    cv::Point2f mean_direction;
     for (const auto& dir : row_directions)
     {
         mean_direction += dir;
     }
-    mean_direction.normalize();
-    const Eigen::Vector2f perpendicular(-mean_direction.y(), mean_direction.x());
+    mean_direction /= cv::norm(mean_direction);
+    const cv::Point2f perpendicular(-mean_direction.y, mean_direction.x);
 
     // Pick a reference point (from the first row with direction)
-    const Eigen::Vector2f ref_point = row_infos.at(rows_with_direction[0]).point_on_line;
+    const cv::Point2f ref_point = row_infos.at(rows_with_direction[0]).point_on_line;
 
     // Step 2.3 & 2.4: Compute intersections with perpendicular line and mean offset
     std::vector<std::pair<float, RowIdx>> intersections;  // (distance along perpendicular, row_idx)
@@ -288,17 +289,17 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
         // ri.point_on_line + s * ri.direction = ref_point + t * perpendicular
         // Solve for t: (ri.point_on_line - ref_point) = t * perpendicular - s * ri.direction
 
-        const Eigen::Vector2f diff = ri.point_on_line - ref_point;
-        const Eigen::Vector2f& d = ri.direction.value();
+        const cv::Point2f diff = ri.point_on_line - ref_point;
+        const cv::Point2f& d = ri.direction.value();
 
         // Using 2D cross product to solve
-        const float denom = perpendicular.x() * d.y() - perpendicular.y() * d.x();
+        const float denom = perpendicular.x * d.y - perpendicular.y * d.x;
         if (std::abs(denom) < 1e-6f)
         {
             continue;
         }
 
-        const float t = (diff.x() * d.y() - diff.y() * d.x()) / denom;
+        const float t = (diff.x * d.y - diff.y * d.x) / denom;
         intersections.emplace_back(t, row_idx);
     }
 
@@ -337,7 +338,7 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
     const float max_t = intersections.back().first;
 
     // Direction extrapolation: use edge row directions or mean direction
-    Eigen::Vector2f direction_for_candidates = mean_direction;
+    cv::Point2f direction_for_candidates = mean_direction;
     if (rows_with_direction.size() >= 2)
     {
         // Could extrapolate, but for simplicity use mean
@@ -345,7 +346,7 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
     }
 
     // Create candidate rows
-    std::map<RowIdx, Eigen::Vector2f> candidate_row_points;
+    std::map<RowIdx, cv::Point2f> candidate_row_points;
 
     // Candidates above (smaller row indices)
     for (int candidate_row = min_row - 1; candidate_row >= 0; --candidate_row)
@@ -367,7 +368,7 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
     for (const MarkerIdx marker_idx : remaining_unassigned)
     {
         const base::MarkerRing& marker = all_markers[marker_idx];
-        const Eigen::Vector2f pos(marker.col_, marker.row_);
+        const cv::Point2f pos(marker.col_, marker.row_);
 
         float min_dist = kLineDistanceTolerance;
         RowIdx best_candidate_row = -1;
@@ -375,8 +376,8 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
         for (const auto& [row_idx, point_on_line] : candidate_row_points)
         {
             // Distance to candidate line
-            const Eigen::Vector2f v = pos - point_on_line;
-            const float dist = std::abs(v.x() * (-direction_for_candidates.y()) + v.y() * direction_for_candidates.x());
+            const cv::Point2f v = pos - point_on_line;
+            const float dist = std::abs(v.x * (-direction_for_candidates.y) + v.y * direction_for_candidates.x);
 
             if (dist < min_dist)
             {
@@ -450,32 +451,28 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
 
     // Step 3.2: Compute row direction (direction along which columns are separated)
     // Columns are separated along the row direction (horizontal), not perpendicular to it
-    Eigen::Vector2f row_direction = Eigen::Vector2f::Zero();
+    cv::Point2f row_direction;
     for (const auto& [row_idx, row_info] : row_infos)
-    {
         if (row_info.direction.has_value())
-        {
             row_direction += row_info.direction.value();
-        }
-    }
-    if (row_direction.norm() < 1e-6f)
-    {
+
+    if (const double norm = cv::norm(row_direction); norm > 1e-6)
+        row_direction /= norm;
+    else
         return;  // No valid row directions
-    }
-    row_direction.normalize();
 
     // Helper lambda to compute column positions for a given parity
-    auto compute_col_positions = [&](const std::map<int, std::vector<MarkerIdx>>& markers_by_col)
-        -> std::tuple<std::vector<std::pair<float, int>>, Eigen::Vector2f, float>
+    const auto compute_col_positions = [&](const std::map<int, std::vector<MarkerIdx>>& markers_by_col)
+        -> std::tuple<std::vector<std::pair<float, int>>, cv::Point2f, float>
     {
         if (markers_by_col.empty())
         {
-            return {{}, Eigen::Vector2f::Zero(), 0.f};
+            return {{}, cv::Point2f(), 0.f};
         }
 
         // Get reference point from first marker
-        const MarkerIdx first_marker = markers_by_col.begin()->second.front();
-        const Eigen::Vector2f ref_point(all_markers[first_marker].col_, all_markers[first_marker].row_);
+        const auto first_marker = all_markers.at(markers_by_col.begin()->second.front());
+        const cv::Point2f ref_point(first_marker.col_, first_marker.row_);
 
         // For each column, compute mean position projected onto perpendicular direction
         std::vector<std::pair<float, int>> col_positions;
@@ -484,8 +481,8 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
             float sum_proj = 0.f;
             for (const MarkerIdx idx : indices)
             {
-                const Eigen::Vector2f pos(all_markers[idx].col_, all_markers[idx].row_);
-                const Eigen::Vector2f diff = pos - ref_point;
+                const cv::Point2f pos(all_markers[idx].col_, all_markers[idx].row_);
+                const cv::Point2f diff = pos - ref_point;
                 sum_proj += diff.dot(row_direction);
             }
             const float mean_proj = sum_proj / static_cast<float>(indices.size());
@@ -522,7 +519,7 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
     for (const auto& [row_idx, marker_idx] : markers_needing_col)
     {
         const base::MarkerRing& marker = all_markers[marker_idx];
-        const Eigen::Vector2f pos(marker.col_, marker.row_);
+        const cv::Point2f pos(marker.col_, marker.row_);
 
         // Select column positions based on row parity
         const bool is_even = (row_idx % 2 == 0);
@@ -536,7 +533,7 @@ void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vect
         }
 
         // Project marker position onto row direction to get column position
-        const Eigen::Vector2f diff = pos - ref_point;
+        const cv::Point2f diff = pos - ref_point;
         const float proj = diff.dot(row_direction);
 
         // Find closest column
@@ -580,10 +577,12 @@ namespace identification
 
 using circlegrid::TrackingState;
 
-void TrackingState::update(const std::vector<base::MarkerCoding>& markers, const std::vector<int>& global_ids)
+void TrackingState::update(const std::vector<base::MarkerCoding>& markers, const std::vector<int>& global_ids,
+                           const cv::Mat1b& image)
 {
     prev_markers_ = markers;
     prev_global_ids_ = global_ids;
+    prev_image_ = image.clone();
     has_previous_ = true;
 }
 
@@ -591,6 +590,7 @@ void TrackingState::clear()
 {
     prev_markers_.clear();
     prev_global_ids_.clear();
+    prev_image_.release();
     has_previous_ = false;
 }
 
@@ -599,6 +599,9 @@ std::optional<std::vector<int>> circlegrid::identify_with_tracking(const std::ve
                                                                    const std::vector<int>& prev_ids,
                                                                    float distance_threshold, float ransac_threshold)
 {
+    constexpr float kRatioThreshold = 0.75f;
+    constexpr size_t kMinCorrespondences = 4;
+
     spdlog::debug("identify_with_tracking: prev={}, curr={}", prev_markers.size(), curr_markers.size());
 
     if (prev_markers.empty() || curr_markers.empty())
@@ -633,8 +636,6 @@ std::optional<std::vector<int>> circlegrid::identify_with_tracking(const std::ve
     std::vector<cv::Point2f> src_pts, dst_pts;
     std::vector<std::pair<int, int>> correspondences;
 
-    constexpr float kRatioThreshold = 0.9f;
-
     for (size_t i = 0; i < knn_matches.size(); ++i)
     {
         if (knn_matches[i].size() < 2)
@@ -645,10 +646,10 @@ std::optional<std::vector<int>> circlegrid::identify_with_tracking(const std::ve
         const auto& best = knn_matches[i][0];
         const auto& second = knn_matches[i][1];
 
-        // if (best.distance > kRatioThreshold * second.distance)
-        // {
-        //     continue;
-        // }
+        if (best.distance > kRatioThreshold * second.distance)
+        {
+            continue;
+        }
 
         if (best.distance > distance_threshold)
         {
@@ -669,7 +670,6 @@ std::optional<std::vector<int>> circlegrid::identify_with_tracking(const std::ve
         }
     }
 
-    constexpr size_t kMinCorrespondences = 4;
     if (correspondences.size() < kMinCorrespondences)
     {
         spdlog::debug("Tracking: insufficient correspondences ({} < {})", correspondences.size(), kMinCorrespondences);
@@ -709,8 +709,122 @@ std::optional<std::vector<int>> circlegrid::identify_with_tracking(const std::ve
     return global_ids;
 }
 
+bool circlegrid::validate_tracking_with_ecc(const std::vector<base::MarkerCoding>& prev_markers,
+                                            const std::vector<base::MarkerCoding>& curr_markers,
+                                            const cv::Mat1b& prev_image, const cv::Mat1b& curr_image,
+                                            float distance_threshold, float ransac_threshold, float ecc_threshold)
+{
+    constexpr float kRatioThreshold = 0.75f;
+    constexpr size_t kMinCorrespondences = 4;
+
+    if (prev_markers.empty() || curr_markers.empty())
+    {
+        return false;
+    }
+
+    // Build point matrices for BFMatcher
+    cv::Mat prev_pts(int(prev_markers.size()), 2, CV_32F);
+    cv::Mat curr_pts(int(curr_markers.size()), 2, CV_32F);
+
+    for (size_t idx = 0; idx < prev_markers.size(); ++idx)
+    {
+        prev_pts.at<float>(int(idx), 0) = prev_markers[idx].col_;
+        prev_pts.at<float>(int(idx), 1) = prev_markers[idx].row_;
+    }
+    for (size_t idx = 0; idx < curr_markers.size(); ++idx)
+    {
+        curr_pts.at<float>(int(idx), 0) = curr_markers[idx].col_;
+        curr_pts.at<float>(int(idx), 1) = curr_markers[idx].row_;
+    }
+
+    // Swap if needed (smaller set as query)
+    bool swapped = false;
+    if (curr_markers.size() > prev_markers.size())
+    {
+        cv::swap(prev_pts, curr_pts);
+        swapped = true;
+    }
+
+    // KNN matching
+    cv::BFMatcher matcher(cv::NORM_L2);
+    std::vector<std::vector<cv::DMatch>> knn_matches;
+    matcher.knnMatch(curr_pts, prev_pts, knn_matches, 2);
+
+    std::vector<cv::Point2f> src_pts, dst_pts;
+
+    for (size_t i = 0; i < knn_matches.size(); ++i)
+    {
+        if (knn_matches[i].size() < 2)
+        {
+            continue;
+        }
+
+        const auto& best = knn_matches[i][0];
+        const auto& second = knn_matches[i][1];
+
+        if (best.distance > kRatioThreshold * second.distance)
+        {
+            continue;
+        }
+        if (best.distance > distance_threshold)
+        {
+            continue;
+        }
+
+        if (swapped)
+        {
+            src_pts.emplace_back(curr_markers[best.trainIdx].col_, curr_markers[best.trainIdx].row_);
+            dst_pts.emplace_back(prev_markers[i].col_, prev_markers[i].row_);
+        }
+        else
+        {
+            src_pts.emplace_back(curr_markers[i].col_, curr_markers[i].row_);
+            dst_pts.emplace_back(prev_markers[best.trainIdx].col_, prev_markers[best.trainIdx].row_);
+        }
+    }
+
+    if (src_pts.size() < kMinCorrespondences)
+    {
+        spdlog::debug("ECC validation: insufficient correspondences ({})", src_pts.size());
+        return false;
+    }
+
+    // Compute homography
+    std::vector<uchar> inlier_mask;
+    const cv::Mat H = cv::findHomography(src_pts, dst_pts, cv::RANSAC, ransac_threshold, inlier_mask);
+
+    if (H.empty())
+    {
+        spdlog::debug("ECC validation: homography computation failed");
+        return false;
+    }
+
+    // Warp current image to align with previous
+    cv::Mat1b warped_curr;
+    cv::warpPerspective(curr_image, warped_curr, H, prev_image.size());
+
+    // Compute ECC between warped current and previous
+    try
+    {
+        cv::Mat warp_matrix = cv::Mat::eye(2, 3, CV_32F);  // Identity for translation-only refinement
+        const double ecc =
+            cv::findTransformECC(prev_image, warped_curr, warp_matrix, cv::MOTION_TRANSLATION,
+                                 cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 50, 0.001));
+
+        spdlog::debug("ECC validation: ECC score = {:.3f} (threshold = {:.1f})", ecc, ecc_threshold);
+        return ecc >= ecc_threshold;
+    }
+    catch (const cv::Exception& e)
+    {
+        spdlog::debug("ECC validation: findTransformECC failed - {}", e.what());
+        return false;
+    }
+}
+
 void circlegrid::identify_new_markers_by_row_lines(std::vector<base::MarkerRing>& markers, const BoardCircleGrid& board)
 {
+    constexpr float kLineDistanceThreshold = 10.0f;
+
     std::vector<MarkerIdx> unindentified_indices;
     std::map<RowIdx, RowInfo> row_infos;
     for (size_t marker_idx = 0; marker_idx < markers.size(); ++marker_idx)
@@ -729,28 +843,30 @@ void circlegrid::identify_new_markers_by_row_lines(std::vector<base::MarkerRing>
         if (row_info.marker_indices.size() < 2)
         {
             // Use the actual marker in this row, not markers[0]
-            const MarkerIdx idx = row_info.marker_indices[0];
-            row_info.point_on_line = Eigen::Vector2f(markers[idx].col_, markers[idx].row_);
+            const auto& marker = markers[row_info.marker_indices[0]];
+            row_info.point_on_line = cv::Point2f(marker.col_, marker.row_);
             continue;
         }
-        std::vector<std::pair<float, MarkerIdx>> sorted;
+        std::vector<std::pair<double, MarkerIdx>> sorted;
 
         // Find the marker with the lowest global_id_ in this row
         MarkerIdx reference_idx = row_info.marker_indices[0];
         for (const MarkerIdx idx : row_info.marker_indices)
         {
-            if (markers[idx].global_id_ < markers[reference_idx].global_id_)
+            const auto& marker = markers[idx];
+            const auto& reference_marker = markers[reference_idx];
+            if (marker.global_id_ < reference_marker.global_id_)
             {
                 reference_idx = idx;
             }
         }
 
-        const Eigen::Vector2f reference_point(markers[reference_idx].col_, markers[reference_idx].row_);
+        const cv::Point2f reference_point(markers[reference_idx].col_, markers[reference_idx].row_);
 
         for (const MarkerIdx idx : row_info.marker_indices)
         {
-            const Eigen::Vector2f point(markers[idx].col_, markers[idx].row_);
-            const float distance = (point - reference_point).norm();
+            const cv::Point2f point(markers[idx].col_, markers[idx].row_);
+            const double distance = cv::norm(point - reference_point);
             sorted.emplace_back(distance, idx);
         }
 
@@ -758,10 +874,10 @@ void circlegrid::identify_new_markers_by_row_lines(std::vector<base::MarkerRing>
 
         const int first = sorted.front().second;
         const int last = sorted.back().second;
-        const Eigen::Vector2f p1(markers[first].col_, markers[first].row_);
-        const Eigen::Vector2f p2(markers[last].col_, markers[last].row_);
+        const cv::Point2f p1(markers[first].col_, markers[first].row_);
+        const cv::Point2f p2(markers[last].col_, markers[last].row_);
 
-        const float length = (p2 - p1).norm();
+        const double length = cv::norm(p2 - p1);
         if (length < 1e-6f)
         {
             continue;
@@ -805,8 +921,6 @@ void circlegrid::identify_new_markers_by_row_lines(std::vector<base::MarkerRing>
         try_fill_missing_rows(row_infos, unindentified_indices, markers, board);
     }
 
-    constexpr float kLineDistanceThreshold = 10.0f;
-
     for (auto& marker : markers)
     {
         if (marker.global_id_ >= 0)
@@ -814,7 +928,7 @@ void circlegrid::identify_new_markers_by_row_lines(std::vector<base::MarkerRing>
             continue;
         }
 
-        const Eigen::Vector2f pos(marker.col_, marker.row_);
+        const cv::Point2f pos(marker.col_, marker.row_);
         float min_dist = kLineDistanceThreshold;
         RowIdx closest_row = -1;
 
@@ -824,8 +938,8 @@ void circlegrid::identify_new_markers_by_row_lines(std::vector<base::MarkerRing>
             {
                 continue;
             }
-            const Eigen::Vector2f v = pos - ri.point_on_line;
-            const float dist = std::abs(v.x() * (-ri.direction->y()) + v.y() * ri.direction->x());
+            const cv::Point2f v = pos - ri.point_on_line;
+            const float dist = std::abs(v.x * (-ri.direction->y) + v.y * ri.direction->x);
             if (dist < min_dist)
             {
                 min_dist = dist;
@@ -927,15 +1041,16 @@ bool circlegrid::test_find_circles_grid(std::vector<int>& indices,
 
             if (!found)
             {
+                indices.push_back(-1);
                 spdlog::warn("Center id {} ({:0.1f}, {:0.1f}) was not identified!", idx_marker, marker.col_,
                              marker.row_);
             }
         }
 
-        if (total_expected_markers != indices.size())
+        if (coding_markers.size() != indices.size())
         {
             throw std::runtime_error(
-                std::format("Identified {} markers of {}!", indices.size(), total_expected_markers));
+                std::format("Identified {} markers of {}!", indices.size(), coding_markers.size()));
         }
     }
 
