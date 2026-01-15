@@ -837,7 +837,6 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
     const cv::Mat1b calibrated_area =
         create_calibrated_area(rings, std::make_unique<BoardCircleGrid>(board), input.rows, input.cols);
 
-    spdlog::info("output_path: {}", output_path.string());
     if constexpr (kShowMarkers)
     {
         if (!output_path.empty())
