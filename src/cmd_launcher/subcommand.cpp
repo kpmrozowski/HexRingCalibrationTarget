@@ -40,7 +40,7 @@ CLI::Option* Subcommand::add_camera(CLI::App& cmd, std::string& camera_id)
 
 CLI::Option* Subcommand::add_board(CLI::App& cmd, int& board_type)
 {
-    return cmd.add_option("-b, --board", board_type, "Board type: 0->RectGrid, 1->HexGrid");
+    return cmd.add_option("-b, --board", board_type, "Board type: 0->RectGrid, 1->HexGrid, 2->CircleGrid");
 }
 
 CLI::Option* Subcommand::add_board_params(CLI::App& cmd, std::vector<float>& board_params)

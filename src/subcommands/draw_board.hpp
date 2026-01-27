@@ -11,6 +11,7 @@ class DrawBoard : public utils::Subcommand
     std::filesystem::path board_params_path_;
     int resolution_;
     int dpi_;
+    bool invert_;
 
    public:
     std::string name() const override { return "DrawBoard"; }
@@ -26,6 +27,7 @@ class DrawBoard : public utils::Subcommand
             ->check(CLI::ExistingFile);
         cmd.add_option("-r, --resolution", resolution_, "AX, where X={-2, -1, 0, 1, 2, 3, 4, 5}.")->default_val(3);
         cmd.add_option("-d, --dpi", dpi_, "Dots per inch.")->default_val(300);
+        cmd.add_flag("--invert", invert_, "invert colors");
     }
 
     void execute() override;

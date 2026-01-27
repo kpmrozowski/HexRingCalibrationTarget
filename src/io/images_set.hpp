@@ -88,8 +88,8 @@ class ImageFilesDataset
     static const std::regex kRegexDataset;
 
    public:
-    ImageFilesDataset(const std::string& path, const std::string_view& camera_id)
-        : path_(path), camera_key_(std::string(camera_id)) {};
+    ImageFilesDataset(const std::string& path, const std::string_view& camera_id, const int start_idx = 0)
+        : path_(path), camera_key_(std::string(camera_id)), start_idx_(start_idx) {};
     std::vector<ImageFileDescriptor> operator()() const;
 
     std::string view_current_type() const { return camera_key_; }
@@ -97,6 +97,7 @@ class ImageFilesDataset
    private:
     const std::string path_;
     const std::string camera_key_;
+    const int start_idx_;
 
     bool read_images_filenames(std::vector<ImageFileDescriptor>& result, const std::regex& regex) const;
 };

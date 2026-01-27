@@ -15,6 +15,7 @@ set(LIB_SRCS
     marker/detection_parameters.cpp
     marker/symmetries.cpp
     marker/thresholds.cpp
+    identification/board_circle/identification_circle.cpp
     identification/board_hex/filtering.cpp
     identification/board_hex/identification_hex.cpp
     identification/board_hex/ordering_hex.cpp
@@ -38,6 +39,8 @@ target_link_libraries(${LIB_NAME}
     opencv::core
     opencv::calib3d
     opencv::imgproc
+    opencv::features2d
+    opencv::video
     Eigen3::Eigen
     ceres
     happly

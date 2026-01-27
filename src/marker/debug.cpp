@@ -12,10 +12,6 @@
 #include "io/debug.hpp"
 #include "io/save_path.hpp"
 
-namespace io::debug
-{
-}  // namespace io::debug
-
 namespace
 {
 void draw_dot(cv::Mat3b &image, const float col_center, const float row_center, const float radius_in_pixel,
@@ -44,11 +40,12 @@ void draw_dot(cv::Mat3b &image, const float col_center, const float row_center, 
 
 }  // namespace
 
-namespace marker::debug
+namespace marker
 {
-void save_inner_markers_and_unique(const cv::Mat1b &image, const std::vector<base::MarkerUnidentified> &markers_core,
-                                   const std::vector<base::MarkerUnidentified> &ring_and_coding, const int image_idx,
-                                   const size_t scale_idx)
+void debug::save_inner_markers_and_unique(const cv::Mat1b &image,
+                                          const std::vector<base::MarkerUnidentified> &markers_core,
+                                          const std::vector<base::MarkerUnidentified> &ring_and_coding,
+                                          const int image_idx, const size_t scale_idx)
 {
     cv::Mat3b painted;
     cv::cvtColor(image, painted, cv::COLOR_GRAY2BGR);
@@ -97,9 +94,9 @@ void save_inner_markers_and_unique(const cv::Mat1b &image, const std::vector<bas
     io::debug::save_image(painted, std::format("soup_{}_{}", image_idx, scale_idx), kMarkersSubdir);
 }
 
-void save_inner_markers_and_unique(const cv::Mat1b &image, const std::vector<base::MarkerCoding> &coding,
-                                   const std::vector<base::MarkerRing> &ring, const int image_idx,
-                                   const size_t scale_idx)
+void debug::save_inner_markers_and_unique(const cv::Mat1b &image, const std::vector<base::MarkerCoding> &coding,
+                                          const std::vector<base::MarkerRing> &ring, const int image_idx,
+                                          const size_t scale_idx)
 {
     cv::Mat3b painted;
     cv::cvtColor(image, painted, cv::COLOR_GRAY2BGR);
@@ -122,8 +119,10 @@ void save_inner_markers_and_unique(const cv::Mat1b &image, const std::vector<bas
     io::debug::save_image(painted, std::format("final_{}_{}", image_idx, scale_idx), kMarkersSubdir);
 }
 
-void save_marker_identification(const cv::Mat1b &image, const Eigen::Matrix<std::optional<int>, -1, -1> &ordering,
-                                const std::vector<base::MarkerRing> &markers, const int image_idx)
+void debug::save_marker_identification(const cv::Mat1b &image,
+                                       const Eigen::Matrix<std::optional<int>, -1, -1> &ordering,
+                                       const std::vector<base::MarkerRing> &markers, const int image_idx,
+                                       const std::filesystem::path &output_path)
 {
     cv::Mat3b painted;
     cv::cvtColor(image, painted, cv::COLOR_GRAY2BGR);
@@ -144,12 +143,12 @@ void save_marker_identification(const cv::Mat1b &image, const Eigen::Matrix<std:
         }
     }
 
-    io::debug::save_image(painted, std::format("identified_{}", image_idx), kMarkersSubdir);
+    io::debug::save_image(painted, std::format("identified_{:05d}", image_idx), kMarkersSubdir, output_path);
 }
 
-void save_neighbors_edges(const cv::Mat1b &image, const std::vector<base::MarkerNeighborhood> &neighbors,
-                          const std::vector<base::MarkerCoding> &coding, const std::vector<base::MarkerRing> &ring,
-                          const int image_idx)
+void debug::save_neighbors_edges(const cv::Mat1b &image, const std::vector<base::MarkerNeighborhood> &neighbors,
+                                 const std::vector<base::MarkerCoding> &coding,
+                                 const std::vector<base::MarkerRing> &ring, const int image_idx)
 {
     if (neighbors.empty())
     {
@@ -196,4 +195,4 @@ void save_neighbors_edges(const cv::Mat1b &image, const std::vector<base::Marker
 
     io::debug::save_image(painted, std::format("neighbors_{}", image_idx), kMarkersSubdir);
 }
-}  // namespace marker::debug
+}  // namespace marker

@@ -27,7 +27,7 @@ struct DetectionParameters
 
     float edge_average_difference_allowed = 0.5f;
 
-    std::array<float, 9> brightness_scales_{1.0f, 1.2f, 0.83f, 1.5f, 0.67f, 1.8f, 0.56f, 2.2f, 0.46f};
+    std::array<float, 3> brightness_scales_{1.0f, 1.5f, 0.67f};
 
     DetectionParameters(const float focal_in_pixel, const float core_dimension, const float ring_dimension,
                         const float min_z, const float max_z);

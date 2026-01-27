@@ -1,4 +1,5 @@
 #include "board_params_io.hpp"
+#include <spdlog/spdlog.h>
 
 #include <format>
 #include <fstream>
@@ -47,6 +48,7 @@ constexpr std::string_view kCols = "cols";
 constexpr std::string_view kSpacing = "spacing";
 constexpr std::string_view kRadius = "radius";
 constexpr std::string_view kIsAsymetric = "is_asymetric";
+constexpr std::string_view kPaddingMm = "padding_mm";
 }  // namespace circle
 
 namespace
@@ -105,7 +107,7 @@ BoardCircleGrid::Params read_params_circle(const nlohmann::json& json)
         .radius = json[circle::kRadius.data()].get<float>(),
         .spacing = json[circle::kSpacing.data()].get<float>(),
         .is_asymetric = json[circle::kIsAsymetric.data()].get<bool>(),
-    };
+        .padding_mm = Eigen::Map<Eigen::Vector2i>{json[circle::kPaddingMm.data()].get<std::array<int, 2>>().data()}};
 }
 
 }  // namespace
@@ -133,6 +135,7 @@ io::BoardParams io::read_params(const std::filesystem::path& filepath)
 
     BoardParams params;
     params.type_ = kNameToBoardType.at(board_type_str);
+    spdlog::info("board_type: {}", board_type_str);
 
     switch (params.type_)
     {
