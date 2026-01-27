@@ -150,7 +150,12 @@ void DrawBoard::execute()
         throw std::invalid_argument("Use --board-params or --board-params-path");
     }
 
-    const cv::Mat1b image = draw_canonical_board(calibration_board, mm_per_pixel, resolution_);
+    cv::Mat1b image = draw_canonical_board(calibration_board, mm_per_pixel, resolution_);
+
+    if (invert_)
+    {
+        image = 255 - image;
+    }
 
     const std::string filename = std::format("{}_A{}", calibration_board->name(), board_type_ != 0 ? resolution_ : 3);
     save_board_tiff_real_scale(image, mm_per_pixel, dpi_, name(), filename);
