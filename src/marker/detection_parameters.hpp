@@ -23,11 +23,11 @@ struct DetectionParameters
 
     float interia_ratio_ = 0.4f;
 
-    float min_difference_scale_ = 1.2f;  // at least 20% brighterr
+    float min_difference_scale_ = 1.1f;  // at least 20% brighterr
 
     float edge_average_difference_allowed = 0.5f;
 
-    std::array<float, 3> brightness_scales_{1.0f, 1.5f, 0.67f};
+    std::array<float, 5> brightness_scales_{1.0f, 1.5f, 0.67f, 0.44f, 0.30};
 
     DetectionParameters(const float focal_in_pixel, const float core_dimension, const float ring_dimension,
                         const float min_z, const float max_z);

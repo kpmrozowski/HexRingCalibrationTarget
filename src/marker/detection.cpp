@@ -574,16 +574,29 @@ std::optional<base::ImageDecoding> detection::detect_and_identify(cv::Mat1b &inp
         io::debug::save_image(calibrated_area, std::format("calibrated_area_{}", image_idx), debug::kMarkersSubdir);
     }
 
-    return base::ImageDecoding(input, binarized, inverted_binarization, decoding->ordering(), decoding->markers,
+    return base::ImageDecoding(true, input, binarized, inverted_binarization, decoding->ordering(), decoding->markers,
                                marker_area, calibrated_area);
 }
 
-std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
+base::ImageDecoding detection::detect_and_identify_circlegrid(
     cv::Mat1b &input, const DetectionParameters &parameters, const BoardCircleGrid &board,
     identification::circlegrid::TrackingState &tracker_state, const int image_idx,
     const std::filesystem::path &output_path)
 {
     spdlog::debug("Detecting circle grid markers in image {}", image_idx);
+
+    // Helper to create a failed result
+    auto make_failed_result = [&](const cv::Mat1b &img, const cv::Mat1b &bin = cv::Mat1b(),
+                                  const cv::Mat1b &inv_bin = cv::Mat1b(),
+                                  const std::vector<base::MarkerRing> &markers = {}) {
+        Eigen::Matrix<std::optional<int>, -1, -1> empty_ordering =
+            Eigen::Matrix<std::optional<int>, -1, -1>::Constant(board.rows_, board.cols_, std::nullopt);
+        cv::Mat1b empty_area = cv::Mat1b::zeros(img.rows, img.cols);
+        cv::Mat1b bin_to_use = bin.empty() ? empty_area : bin;
+        cv::Mat1b inv_bin_to_use = inv_bin.empty() ? empty_area : inv_bin;
+        return base::ImageDecoding(false, img, bin_to_use, inv_bin_to_use,
+                                   empty_ordering, markers, empty_area, empty_area);
+    };
 
     if (image_idx == 671)
     {
@@ -703,7 +716,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
     if (best_coding_markers.empty())
     {
         spdlog::warn("image {}: no coding markers found at any brightness scale", image_idx);
-        return std::nullopt;
+        return make_failed_result(input);
     }
 
     spdlog::debug("image {}: selected brightness scale {} with {} markers (findCirclesGrid: {})", image_idx,
@@ -718,7 +731,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
     if (coding_markers.empty())
     {
         spdlog::warn("image {}: no coding markers (full black circles) found", image_idx);
-        return std::nullopt;
+        return make_failed_result(input, binarized, inverted_binarization);
     }
 
     const bool primary_succeeded = best_find_circles_grid_succeeded;
@@ -776,7 +789,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
     if (global_ids.empty())
     {
         spdlog::warn("image {}: tracking failed", image_idx);
-        return std::nullopt;
+        return make_failed_result(input, binarized, inverted_binarization);
     }
 
     if (global_ids.size() != coding_markers.size())
@@ -827,7 +840,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
     if (identified_markers == 0)
     {
         spdlog::warn("image {}: No circle grid markers identified", image_idx);
-        return std::nullopt;
+        return make_failed_result(input, binarized, inverted_binarization, rings);
     }
 
     spdlog::debug("image {}: Final identification: {} / {} markers", image_idx, identified_markers,
@@ -851,7 +864,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify_circlegrid(
         }
     }
 
-    return base::ImageDecoding(input, binarized, inverted_binarization, ordering, rings, marker_area, calibrated_area);
+    return base::ImageDecoding(true, input, binarized, inverted_binarization, ordering, rings, marker_area, calibrated_area);
 }
 
 }  // namespace marker

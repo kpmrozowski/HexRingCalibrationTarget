@@ -129,6 +129,8 @@ class ValidityLocation
 class ImageDecoding
 {
    public:
+    const bool success_;
+
     const cv::Mat1b linear_input_;
 
     const cv::Mat1b binary_;
@@ -138,7 +140,7 @@ class ImageDecoding
 
     const ValidityLocation validity_;
 
-    ImageDecoding(const cv::Mat1b &linear_input, const cv::Mat1b &binary, const cv::Mat1b &inverted_binary,
+    ImageDecoding(bool success, const cv::Mat1b &linear_input, const cv::Mat1b &binary, const cv::Mat1b &inverted_binary,
                   const Eigen::Matrix<std::optional<int>, -1, -1> &ordering, const std::vector<MarkerRing> &markers,
                   const cv::Mat1b &markers_location, const cv::Mat1b &calibrated_area);
 };

@@ -20,7 +20,7 @@ std::optional<base::ImageDecoding> detect_and_identify(cv::Mat1b &input, const D
                                                        const std::unique_ptr<Board> &board, const int image_idx,
                                                        const std::filesystem::path &output_path = {});
 
-std::optional<base::ImageDecoding> detect_and_identify_circlegrid(
+base::ImageDecoding detect_and_identify_circlegrid(
     cv::Mat1b &input, const DetectionParameters &parameters, const BoardCircleGrid &board,
     identification::circlegrid::TrackingState &tracker_state, const int image_idx,
     const std::filesystem::path &output_path = {});
