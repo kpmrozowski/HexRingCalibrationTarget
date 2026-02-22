@@ -25,6 +25,17 @@ struct TrackingState
     void clear();
 };
 
+/// Lightweight tracking state that only stores marker positions (no image for ECC).
+struct LightTrackingState
+{
+    std::vector<base::MarkerCoding> prev_markers_;
+    std::vector<int> prev_global_ids_;
+    bool has_previous_ = false;
+
+    void update(const std::vector<base::MarkerCoding>& markers, const std::vector<int>& global_ids);
+    void clear();
+};
+
 /**
  * @brief Fallback identification using frame-to-frame tracking with KNN + RANSAC
  *
@@ -82,5 +93,15 @@ bool validate_tracking_with_ecc(const std::vector<base::MarkerCoding>& prev_mark
                                 const std::vector<base::MarkerCoding>& curr_markers, const cv::Mat1b& prev_image,
                                 const cv::Mat1b& curr_image, float distance_threshold = 50.0f,
                                 float ransac_threshold = 5.0f, float ecc_threshold = 0.7f);
+
+/**
+ * @brief Geometric-only tracking validation (no image operations).
+ *
+ * Uses KNN + RANSAC homography on marker positions. Validates that
+ * enough inliers exist relative to the number of correspondences.
+ */
+bool validate_tracking_geometric(const std::vector<base::MarkerCoding>& prev_markers,
+                                 const std::vector<base::MarkerCoding>& curr_markers, float distance_threshold = 50.0f,
+                                 float ransac_threshold = 5.0f, float min_inlier_ratio = 0.6f);
 
 }  // namespace identification::circlegrid

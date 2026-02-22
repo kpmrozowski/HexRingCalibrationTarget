@@ -595,6 +595,21 @@ void TrackingState::clear()
     has_previous_ = false;
 }
 
+void circlegrid::LightTrackingState::update(const std::vector<base::MarkerCoding>& markers,
+                                            const std::vector<int>& global_ids)
+{
+    prev_markers_ = markers;
+    prev_global_ids_ = global_ids;
+    has_previous_ = true;
+}
+
+void circlegrid::LightTrackingState::clear()
+{
+    prev_markers_.clear();
+    prev_global_ids_.clear();
+    has_previous_ = false;
+}
+
 std::optional<std::vector<int>> circlegrid::identify_with_tracking(const std::vector<base::MarkerCoding>& prev_markers,
                                                                    const std::vector<base::MarkerCoding>& curr_markers,
                                                                    const std::vector<int>& prev_ids,
@@ -990,6 +1005,87 @@ void circlegrid::identify_new_markers_by_row_lines(std::vector<base::MarkerRing>
                           marker.col_, closest_row, new_col);
         }
     }
+}
+
+bool circlegrid::validate_tracking_geometric(const std::vector<base::MarkerCoding>& prev_markers,
+                                             const std::vector<base::MarkerCoding>& curr_markers,
+                                             float distance_threshold, float ransac_threshold, float min_inlier_ratio)
+{
+    constexpr float kRatioThreshold = 0.75f;
+    constexpr size_t kMinCorrespondences = 4;
+
+    if (prev_markers.empty() || curr_markers.empty())
+    {
+        return false;
+    }
+
+    cv::Mat prev_pts(int(prev_markers.size()), 2, CV_32F);
+    cv::Mat curr_pts(int(curr_markers.size()), 2, CV_32F);
+
+    for (size_t idx = 0; idx < prev_markers.size(); ++idx)
+    {
+        prev_pts.at<float>(int(idx), 0) = prev_markers[idx].col_;
+        prev_pts.at<float>(int(idx), 1) = prev_markers[idx].row_;
+    }
+    for (size_t idx = 0; idx < curr_markers.size(); ++idx)
+    {
+        curr_pts.at<float>(int(idx), 0) = curr_markers[idx].col_;
+        curr_pts.at<float>(int(idx), 1) = curr_markers[idx].row_;
+    }
+
+    bool swapped = false;
+    if (curr_markers.size() > prev_markers.size())
+    {
+        cv::swap(prev_pts, curr_pts);
+        swapped = true;
+    }
+
+    cv::BFMatcher matcher(cv::NORM_L2);
+    std::vector<std::vector<cv::DMatch>> knn_matches;
+    matcher.knnMatch(curr_pts, prev_pts, knn_matches, 2);
+
+    std::vector<cv::Point2f> src_pts, dst_pts;
+
+    for (size_t i = 0; i < knn_matches.size(); ++i)
+    {
+        if (knn_matches[i].size() < 2)
+            continue;
+        const auto& best = knn_matches[i][0];
+        const auto& second = knn_matches[i][1];
+        if (best.distance > kRatioThreshold * second.distance)
+            continue;
+        if (best.distance > distance_threshold)
+            continue;
+
+        if (swapped)
+        {
+            src_pts.emplace_back(curr_markers[best.trainIdx].col_, curr_markers[best.trainIdx].row_);
+            dst_pts.emplace_back(prev_markers[i].col_, prev_markers[i].row_);
+        }
+        else
+        {
+            src_pts.emplace_back(curr_markers[i].col_, curr_markers[i].row_);
+            dst_pts.emplace_back(prev_markers[best.trainIdx].col_, prev_markers[best.trainIdx].row_);
+        }
+    }
+
+    if (src_pts.size() < kMinCorrespondences)
+    {
+        spdlog::debug("Geometric validation: insufficient correspondences ({})", src_pts.size());
+        return false;
+    }
+
+    std::vector<uchar> inlier_mask;
+    const cv::Mat H = cv::findHomography(src_pts, dst_pts, cv::RANSAC, ransac_threshold, inlier_mask);
+    if (H.empty())
+    {
+        return false;
+    }
+
+    const int inlier_count = std::count(inlier_mask.begin(), inlier_mask.end(), 1);
+    const float inlier_ratio = static_cast<float>(inlier_count) / static_cast<float>(src_pts.size());
+    spdlog::debug("Geometric validation: {}/{} inliers ({:.1f}%)", inlier_count, src_pts.size(), inlier_ratio * 100.0f);
+    return inlier_ratio >= min_inlier_ratio;
 }
 
 bool circlegrid::test_find_circles_grid(std::vector<int>& indices,
