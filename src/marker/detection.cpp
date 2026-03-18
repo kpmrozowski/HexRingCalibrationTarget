@@ -22,9 +22,12 @@
 namespace
 {
 
-std::string pth = "/home/kmro/praca/dev/kalibr-ws-dops/out/debug";
+// Default debug path, overridden by output_path parameter in detect_and_identify_circlegrid()
+std::string pth = "out/debug";
 
-void append_tracking_stats_csv(int frame_id, int detected_count, int identified_count, const std::string& method)
+void append_tracking_stats_csv(int frame_id, int detected_count, int identified_count,
+                               const std::string& method,
+                               float homography_reproj_mean = -1.f, float homography_reproj_max = -1.f)
 {
     const std::string dump_dir = []() -> std::string
     {
@@ -41,9 +44,10 @@ void append_tracking_stats_csv(int frame_id, int detected_count, int identified_
     }
     if (!file_exists)
     {
-        ofs << "frame_id,detected_count,identified_count,method\n";
+        ofs << "frame_id,detected_count,identified_count,method,homography_reproj_mean,homography_reproj_max\n";
     }
-    ofs << frame_id << "," << detected_count << "," << identified_count << "," << method << "\n";
+    ofs << frame_id << "," << detected_count << "," << identified_count << "," << method
+        << "," << homography_reproj_mean << "," << homography_reproj_max << "\n";
 }
 
 cv::Mat1b binarize(cv::Mat1b &input, const marker::DetectionParameters &parameters)
@@ -611,6 +615,10 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
 {
     spdlog::info("Detecting circle grid markers in image {}", image_idx);
 
+    // Use output_path if provided, otherwise keep default
+    if (!output_path.empty())
+        pth = output_path.string();
+
     // Declared before lambda so it can be captured by reference
     std::vector<base::MarkerCoding> best_coding_markers;
 
@@ -940,6 +948,21 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
     }
     spdlog::info("image {}: prediction vectors: field_valid={}, vectors={}", image_idx, field_valid, vec_count);
 
+    // Per-marker filter decision tracking for CSV debug output
+    struct MarkerFilterDecision {
+        int disappeared_nbr_gid = -1;
+        float disappeared_dist = -1.f;
+        float disappeared_threshold = -1.f;
+        bool disappeared_rejected = false;
+        bool homography_added = false;
+    };
+    std::unordered_map<size_t, MarkerFilterDecision> filter_decisions;
+
+    // Snapshot gids before homography for tracking which markers were added
+    std::set<size_t> pre_homography_identified;
+    for (size_t i = 0; i < rings.size(); ++i)
+        if (rings[i].global_id_ >= 0) pre_homography_identified.insert(i);
+
     // Always try to identify unmatched markers using local homography
     const int unidentified_count =
         static_cast<int>(std::count_if(rings.begin(), rings.end(), [](const auto& r) { return r.global_id_ < 0; }));
@@ -962,6 +985,63 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
                 identification_method += "+homography";
             }
         }
+    }
+
+    // Compute board aspect ratio for near-square guard (used by multiple filters below)
+    const float board_width = board.is_asymetric_
+        ? static_cast<float>((2 * (board.cols_ - 1) + 1) * board.spacing_)
+        : static_cast<float>((board.cols_ - 1) * board.spacing_);
+    const float board_height = static_cast<float>((board.rows_ - 1) * board.spacing_);
+    const float aspect = std::max(board_width, board_height) / std::max(1.f, std::min(board_width, board_height));
+    const bool is_near_square = aspect < 1.3f;
+
+    // Mark homography-added markers and verify them against velocity field.
+    // The homography step can re-introduce swapped markers that were correctly
+    // rejected by the velocity acceptance check. Re-check newly-added markers.
+    // Only on near-square grids where row/col swaps actually occur.
+    if (is_near_square && tracker_state.forward_blob_field_.valid && tracker_state.backward_blob_field_.valid)
+    {
+        const float img_short = static_cast<float>(std::min(input.cols, input.rows));
+        const float abs_cap = 0.05f * img_short;
+        int homography_vel_rejects = 0;
+        for (size_t i = 0; i < rings.size(); ++i)
+        {
+            if (rings[i].global_id_ < 0) continue;
+            if (pre_homography_identified.count(i) > 0) continue;  // not homography-added
+            filter_decisions[i].homography_added = true;
+
+            // Velocity check on homography-added marker
+            auto track_it = tracker_state.tracks_.find(rings[i].global_id_);
+            if (track_it == tracker_state.tracks_.end() || track_it->second.history_count < 1)
+                continue;
+
+            const cv::Point2f prev_pos = track_it->second.last_position;
+            const cv::Point2f curr_pos(rings[i].col_, rings[i].row_);
+            const cv::Point2f v_fwd = tracker_state.forward_blob_field_.transport_predict(prev_pos);
+            const cv::Point2f predicted_curr = prev_pos + v_fwd;
+            const float fwd_err = static_cast<float>(cv::norm(predicted_curr - curr_pos));
+            const float disp = static_cast<float>(cv::norm(v_fwd));
+            const float tol = std::min(std::max(0.5f * disp, 15.f), abs_cap);
+
+            if (fwd_err > tol)
+            {
+                spdlog::info("image {}: post-homography velocity reject: gid {} fwd_err={:.1f} "
+                             "(tol={:.1f} disp={:.1f}), unsetting",
+                             image_idx, rings[i].global_id_, fwd_err, tol, disp);
+                rings[i].global_id_ = -1;
+                ++homography_vel_rejects;
+            }
+        }
+        if (homography_vel_rejects > 0)
+            spdlog::info("image {}: rejected {} homography-added markers via velocity check",
+                         image_idx, homography_vel_rejects);
+    }
+    else
+    {
+        // Just mark homography-added markers without velocity check
+        for (size_t i = 0; i < rings.size(); ++i)
+            if (rings[i].global_id_ >= 0 && pre_homography_identified.count(i) == 0)
+                filter_decisions[i].homography_added = true;
     }
 
     // Fix individual row swaps using the last findCirclesGrid frame as trusted reference.
@@ -1054,18 +1134,9 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
     }
 
     // Disappeared-neighbor swap detection: if gid X is assigned to a marker at
-    // approximately the PREVIOUS position of gid Y (adjacent row, same column),
+    // approximately the PREVIOUS position of gid Y (a hex neighbor),
     // and gid Y is NOT in the current frame, then gid X likely stole gid Y's marker.
-    // Unset gid X to prevent the swap from propagating.
     // Only run on near-square grids where row swaps actually occur.
-    // For clearly rectangular grids (aspect ratio > 1.3), findCirclesGrid is unambiguous.
-    const float board_width = board.is_asymetric_
-        ? static_cast<float>((2 * (board.cols_ - 1) + 1) * board.spacing_)
-        : static_cast<float>((board.cols_ - 1) * board.spacing_);
-    const float board_height = static_cast<float>((board.rows_ - 1) * board.spacing_);
-    const float aspect = std::max(board_width, board_height) / std::max(1.f, std::min(board_width, board_height));
-    const bool is_near_square = aspect < 1.3f;
-
     if (tracker_state.has_previous_ && identification_method != "findCirclesGrid" && is_near_square)
     {
         const int total = board.rows_ * board.cols_;
@@ -1101,49 +1172,157 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
         if (motion_count > 0)
             avg_motion /= static_cast<float>(motion_count);
 
-        const float swap_dist_threshold = 20.f;  // max distance after motion compensation
+        // Threshold for motion-compensated distance. Scale with average velocity
+        // to handle fast-moving boards (prediction error ∝ speed).
+        const float avg_speed = tracker_state.forward_blob_field_.valid
+            ? std::sqrt(tracker_state.forward_blob_field_.vCx * tracker_state.forward_blob_field_.vCx
+                      + tracker_state.forward_blob_field_.vCy * tracker_state.forward_blob_field_.vCy)
+            : static_cast<float>(cv::norm(avg_motion));
+        const float swap_dist_threshold = std::max(20.f, 0.5f * avg_speed);  // min 20px, or 50% of speed
         int disappeared_swaps = 0;
 
-        for (auto& ring : rings)
+        // Iterate until no more cascading swaps found.
+        // Each pass may unset a marker, making its neighbor "missing" for the next pass.
+        // E.g.: M0 missing → M1 at M0's spot (unset) → M6 at M1's spot (unset next pass).
+        for (int pass = 0; pass < 5; ++pass)  // max 5 cascade levels
         {
-            if (ring.global_id_ < 0) continue;
-            const int gid = ring.global_id_;
-            const int row = gid / board.cols_;
-            const int col = gid % board.cols_;
-            const cv::Point2f pos(ring.col_, ring.row_);
-
-            // Check adjacent rows: is there a neighbor gid that disappeared?
-            for (int dr = -1; dr <= 1; dr += 2)  // row ±1
+            int pass_swaps = 0;
+            for (auto& ring : rings)
             {
-                const int nbr_row = row + dr;
-                if (nbr_row < 0 || nbr_row >= board.rows_) continue;
-                const int nbr_gid = board.row_and_col_to_id(nbr_row, col);
+                if (ring.global_id_ < 0) continue;
+                const int gid = ring.global_id_;
+                const int row = gid / board.cols_;
+                const int col = gid % board.cols_;
+                const cv::Point2f pos(ring.col_, ring.row_);
 
-                // Is the neighbor MISSING in current frame but WAS in previous frame?
-                if (assigned_gids.count(nbr_gid) == 0 && prev_gid_pos.count(nbr_gid) > 0)
+                // Check all physically adjacent neighbors on the asymmetric hex grid.
+                // In an asymmetric grid, physical layout is:
+                //   x = (2*col + row%2) * spacing,  y = row * spacing
+                // So each marker has 6 hex neighbors:
+                //   same row: col±1
+                //   row-1: col+0 and col-1+row%2  (depends on row parity)
+                //   row+1: col+0 and col-1+row%2
+                // For non-asymmetric grids, just use 4-connected.
+                struct Neighbor { int row; int col; };
+                std::vector<Neighbor> neighbors;
+                neighbors.reserve(6);
+                // Same-row neighbors
+                neighbors.push_back({row, col - 1});
+                neighbors.push_back({row, col + 1});
+                // Adjacent-row neighbors (hex connectivity)
+                if (board.is_asymetric_)
                 {
-                    // Is the current marker at approximately the MOTION-COMPENSATED position
-                    // of the missing neighbor? Scale motion by frames elapsed since last seen.
-                    const auto& nbr_track = tracker_state.tracks_.at(nbr_gid);
-                    const int frames_since = tracker_state.frame_counter_ - nbr_track.last_seen_frame;
-                    const cv::Point2f scaled_motion = avg_motion * static_cast<float>(std::max(1, frames_since));
-                    const cv::Point2f expected_nbr_pos = prev_gid_pos[nbr_gid] + scaled_motion;
-                    const float dist_to_expected = static_cast<float>(cv::norm(pos - expected_nbr_pos));
-                    if (dist_to_expected < swap_dist_threshold)
+                    const int off = (row % 2 == 0) ? -1 : 0;  // hex offset
+                    neighbors.push_back({row - 1, col + off});
+                    neighbors.push_back({row - 1, col + off + 1});
+                    neighbors.push_back({row + 1, col + off});
+                    neighbors.push_back({row + 1, col + off + 1});
+                }
+                else
+                {
+                    neighbors.push_back({row - 1, col});
+                    neighbors.push_back({row + 1, col});
+                }
+
+                for (const auto& [nbr_row, nbr_col] : neighbors)
+                {
+                    if (nbr_row < 0 || nbr_row >= board.rows_) continue;
+                    if (nbr_col < 0 || nbr_col >= board.cols_) continue;
+                    const int nbr_gid = board.row_and_col_to_id(nbr_row, nbr_col);
+
+                    // Is the neighbor MISSING in current frame but WAS seen recently?
+                    if (assigned_gids.count(nbr_gid) == 0 && prev_gid_pos.count(nbr_gid) > 0)
                     {
-                        spdlog::info("image {}: disappeared-neighbor swap: gid {} at prev gid {} pos "
-                                     "(dist={:.1f}px, motion=({:.1f},{:.1f})), unsetting",
-                                     image_idx, gid, nbr_gid, dist_to_expected, avg_motion.x, avg_motion.y);
-                        ring.global_id_ = -1;
-                        ++disappeared_swaps;
-                        break;
+                        // Is the current marker at the MOTION-COMPENSATED position
+                        // of the missing neighbor? Use velocity field if available.
+                        const auto& nbr_track = tracker_state.tracks_.at(nbr_gid);
+                        const int frames_since = tracker_state.frame_counter_ - nbr_track.last_seen_frame;
+                        cv::Point2f expected_nbr_pos;
+                        if (tracker_state.forward_blob_field_.valid)
+                        {
+                            const cv::Point2f pred = tracker_state.forward_blob_field_.transport_predict(
+                                prev_gid_pos[nbr_gid], static_cast<float>(std::max(1, frames_since)));
+                            expected_nbr_pos = prev_gid_pos[nbr_gid] + pred;
+                        }
+                        else
+                        {
+                            const cv::Point2f scaled_motion = avg_motion * static_cast<float>(std::max(1, frames_since));
+                            expected_nbr_pos = prev_gid_pos[nbr_gid] + scaled_motion;
+                        }
+                        const float dist_to_expected = static_cast<float>(cv::norm(pos - expected_nbr_pos));
+                        // Record decision for CSV
+                        const size_t ring_idx = static_cast<size_t>(&ring - &rings[0]);
+                        if (dist_to_expected < swap_dist_threshold)
+                        {
+                            filter_decisions[ring_idx] = {nbr_gid, dist_to_expected,
+                                                           swap_dist_threshold, true, false};
+                            spdlog::info("image {}: disappeared-neighbor swap (pass {}): gid {} at prev gid {} pos "
+                                         "(dist={:.1f}px, motion-comp), unsetting",
+                                         image_idx, pass, gid, nbr_gid, dist_to_expected);
+                            ring.global_id_ = -1;
+                            assigned_gids.erase(gid);
+                            ++pass_swaps;
+                            break;
+                        }
                     }
                 }
             }
+            disappeared_swaps += pass_swaps;
+            if (pass_swaps == 0) break;  // no more cascading swaps
         }
         if (disappeared_swaps > 0)
         {
             spdlog::info("image {}: fixed {} disappeared-neighbor swaps", image_idx, disappeared_swaps);
+        }
+    }
+
+    // Per-frame homography reprojection quality: compute RANSAC homography from
+    // board coordinates to final identified image positions, then measure per-marker error.
+    std::unordered_map<size_t, float> homography_reproj_error;
+    float frame_reproj_mean = -1.f, frame_reproj_max = -1.f;
+    {
+        std::vector<cv::Point2f> board_pts_q, image_pts_q;
+        std::vector<size_t> ring_indices_q;
+        const int total = board.rows_ * board.cols_;
+        for (size_t i = 0; i < rings.size(); ++i)
+        {
+            if (rings[i].global_id_ < 0 || rings[i].global_id_ >= total) continue;
+            const int r = rings[i].global_id_ / board.cols_;
+            const int c = rings[i].global_id_ % board.cols_;
+            const float bx = board.is_asymetric_ ? static_cast<float>((2*c + r%2) * board.spacing_)
+                                                   : static_cast<float>(c * board.spacing_);
+            const float by = static_cast<float>(r * board.spacing_);
+            board_pts_q.emplace_back(bx, by);
+            image_pts_q.emplace_back(rings[i].col_, rings[i].row_);
+            ring_indices_q.push_back(i);
+        }
+
+        if (board_pts_q.size() >= 8)
+        {
+            const cv::Mat H_q = cv::findHomography(board_pts_q, image_pts_q, cv::RANSAC, 5.0);
+            if (!H_q.empty())
+            {
+                float sum_err = 0.f, max_err = 0.f;
+                for (size_t j = 0; j < board_pts_q.size(); ++j)
+                {
+                    const cv::Mat pt = (cv::Mat_<double>(3,1) << board_pts_q[j].x, board_pts_q[j].y, 1.0);
+                    const cv::Mat proj = H_q * pt;
+                    const cv::Point2f projected(static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
+                                                 static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+                    const float err = static_cast<float>(cv::norm(projected - image_pts_q[j]));
+                    homography_reproj_error[ring_indices_q[j]] = err;
+                    sum_err += err;
+                    max_err = std::max(max_err, err);
+                }
+                frame_reproj_mean = sum_err / static_cast<float>(board_pts_q.size());
+                frame_reproj_max = max_err;
+
+                if (frame_reproj_mean > 5.0f)
+                {
+                    spdlog::warn("image {}: HIGH homography reprojection error: mean={:.2f}px max={:.2f}px "
+                                 "({} markers)", image_idx, frame_reproj_mean, frame_reproj_max, board_pts_q.size());
+                }
+            }
         }
     }
 
@@ -1154,6 +1333,112 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
         current_ids.push_back(r.global_id_);
     }
     tracker_state.last_method_ = identification_method;
+
+    // Write per-frame debug CSV with per-marker filter decisions.
+    // One CSV per frame: <debug_dir>/filter-csv/frame_NNNNNN.csv
+    {
+        static const std::string csv_dir = [&]() {
+            const std::string d = pth + "/filter-csv";
+            std::filesystem::create_directories(d);
+            return d;
+        }();
+        const std::string csv_path = std::format("{}/frame_{:06d}.csv", csv_dir, image_idx);
+        std::ofstream csv(csv_path);
+        if (csv.is_open())
+        {
+            // Header
+            csv << "marker_idx,pixel_x,pixel_y,final_gid,method,"
+                   "vel_field_valid,vel_vCx,vel_vCy,vel_omega,vel_sigma,vel_rms,vel_inliers,vel_total,"
+                   "vel_fwd_err,vel_bwd_err,vel_tolerance,vel_rejected,"
+                   "disappeared_nbr_gid,disappeared_dist,disappeared_threshold,disappeared_rejected,"
+                   "homography_added,fcg_swap_fixed,"
+                   "track_prev_x,track_prev_y,predicted_x,predicted_y,"
+                   "homography_reproj,frame_reproj_mean,frame_reproj_max\n";
+
+            // Velocity field info (same for all markers in this frame)
+            const auto& fwd = tracker_state.forward_blob_field_;
+            const bool fv = fwd.valid;
+
+            for (size_t i = 0; i < rings.size(); ++i)
+            {
+                const auto& ring = rings[i];
+                csv << i << ','
+                    << ring.col_ << ',' << ring.row_ << ','
+                    << ring.global_id_ << ','
+                    << identification_method << ',';
+
+                // Velocity field model parameters
+                csv << (fv ? 1 : 0) << ','
+                    << (fv ? fwd.vCx : 0.f) << ','
+                    << (fv ? fwd.vCy : 0.f) << ','
+                    << (fv ? fwd.omega : 0.f) << ','
+                    << (fv ? fwd.sigma : 0.f) << ','
+                    << (fv ? fwd.velocity_residual_rms : 0.f) << ','
+                    << (fv ? fwd.velocity_inlier_count : 0) << ','
+                    << (fv ? static_cast<int>(fwd.positions.size()) : 0) << ',';
+
+                // Per-marker velocity check (compute live — same logic as acceptance check)
+                float fwd_err = -1.f, bwd_err = -1.f, tol = -1.f;
+                bool vel_rejected = false;
+                float track_prev_x = -1.f, track_prev_y = -1.f;
+                float predicted_x = -1.f, predicted_y = -1.f;
+                if (ring.global_id_ >= 0 && fv && tracker_state.backward_blob_field_.valid)
+                {
+                    auto track_it = tracker_state.tracks_.find(ring.global_id_);
+                    if (track_it != tracker_state.tracks_.end() && track_it->second.history_count >= 1)
+                    {
+                        const cv::Point2f prev_pos = track_it->second.last_position;
+                        const cv::Point2f curr_pos(ring.col_, ring.row_);
+                        const cv::Point2f v_fwd = fwd.transport_predict(prev_pos);
+                        const cv::Point2f pred_curr = prev_pos + v_fwd;
+                        const cv::Point2f v_bwd = tracker_state.backward_blob_field_.transport_predict(curr_pos);
+                        const cv::Point2f pred_prev = curr_pos - v_bwd;
+                        fwd_err = static_cast<float>(cv::norm(pred_curr - curr_pos));
+                        bwd_err = static_cast<float>(cv::norm(pred_prev - prev_pos));
+                        const float disp = static_cast<float>(cv::norm(v_fwd));
+                        const float img_short = static_cast<float>(
+                            std::min(input.cols, input.rows));
+                        tol = std::min(std::max(0.5f * disp, 15.f), 0.05f * img_short);
+                        vel_rejected = (fwd_err > tol || bwd_err > tol);
+                        track_prev_x = prev_pos.x;
+                        track_prev_y = prev_pos.y;
+                        predicted_x = pred_curr.x;
+                        predicted_y = pred_curr.y;
+                    }
+                }
+                csv << fwd_err << ',' << bwd_err << ',' << tol << ','
+                    << (vel_rejected ? 1 : 0) << ',';
+
+                // Disappeared-neighbor decision
+                const auto fd_it = filter_decisions.find(i);
+                if (fd_it != filter_decisions.end())
+                {
+                    csv << fd_it->second.disappeared_nbr_gid << ','
+                        << fd_it->second.disappeared_dist << ','
+                        << fd_it->second.disappeared_threshold << ','
+                        << (fd_it->second.disappeared_rejected ? 1 : 0) << ','
+                        << (fd_it->second.homography_added ? 1 : 0) << ',';
+                }
+                else
+                {
+                    csv << -1 << ',' << -1.f << ',' << -1.f << ',' << 0 << ','
+                        << 0 << ',';
+                }
+                // fcg swap (not individually tracked yet)
+                csv << 0 << ',';
+
+                // Track history
+                csv << track_prev_x << ',' << track_prev_y << ','
+                    << predicted_x << ',' << predicted_y << ',';
+
+                // Homography reprojection quality
+                auto reproj_it = homography_reproj_error.find(i);
+                csv << (reproj_it != homography_reproj_error.end() ? reproj_it->second : -1.f) << ','
+                    << frame_reproj_mean << ',' << frame_reproj_max << '\n';
+            }
+        }
+    }
+
     tracker_state.update(coding_markers, current_ids, input);
 
     Eigen::Matrix<std::optional<int>, -1, -1> ordering =
@@ -1177,11 +1462,26 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
         return make_failed_result(input, binarized, inverted_binarization, rings);
     }
 
+    // Quality gate: reject frames with high homography reprojection error.
+    // These indicate gross detection errors (misidentified markers) that would
+    // corrupt PnP poses and pollute the IMU-camera optimizer.
+    constexpr float kMaxFrameReprojMean = 5.0f;
+    if (frame_reproj_mean > kMaxFrameReprojMean && frame_reproj_mean > 0.f)
+    {
+        spdlog::warn("image {}: REJECTED: homography reproj mean={:.2f}px > {:.1f}px threshold "
+                     "(max={:.2f}px, {} markers), marking as failed",
+                     image_idx, frame_reproj_mean, kMaxFrameReprojMean,
+                     frame_reproj_max, identified_markers);
+        append_tracking_stats_csv(image_idx, static_cast<int>(coding_markers.size()), identified_markers,
+                                  "rejected_reproj", frame_reproj_mean, frame_reproj_max);
+        return make_failed_result(input, binarized, inverted_binarization, rings);
+    }
+
     spdlog::info("image {}: Final identification: {} / {} markers (method: {})", image_idx, identified_markers,
                   total_expected_markers, identification_method);
 
     append_tracking_stats_csv(image_idx, static_cast<int>(coding_markers.size()), identified_markers,
-                              identification_method);
+                              identification_method, frame_reproj_mean, frame_reproj_max);
 
     const cv::Mat1b marker_area = create_marker_area(rings, input.rows, input.cols);
     const cv::Mat1b calibrated_area =

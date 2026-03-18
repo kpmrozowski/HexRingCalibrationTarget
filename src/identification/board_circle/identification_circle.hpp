@@ -58,18 +58,39 @@ struct ORBMotionField
 
 /// Blob-level velocity+acceleration field — anchored at blob positions, ID-independent.
 /// Uses identified marker tracks for exact velocity/acceleration computation.
+/// A single global similarity model (vCx, vCy, ω, σ) is fitted via RANSAC from all markers.
+/// The similarity model captures translation + rotation + isotropic scale (approach/recede).
 struct BlobVelocityField
 {
+    // Per-marker data (kept for residuals and debug visualization)
     std::vector<cv::Point2f> positions;        // anchor positions
     std::vector<cv::Point2f> velocities;       // displacement vectors per frame (px/frame)
     std::vector<cv::Point2f> accelerations;    // central-diff acceleration (px/frame²), zero if unavailable
+
+    // Global similarity velocity model: v(p) = v_C + ω × r + σ · r
+    //   vx = vCx - ω*ry + σ*rx
+    //   vy = vCy + ω*rx + σ*ry
+    cv::Point2f centroid{0.f, 0.f};
+    float vCx = 0.f, vCy = 0.f;               // translation velocity at centroid (px/frame)
+    float omega = 0.f;                          // angular velocity (rad/frame)
+    float sigma = 0.f;                          // isotropic scale rate (1/frame), >0 = expanding
+
+    // Global acceleration model: a(p) = a_C + ε × r + σ_dot · r + centripetal terms
+    float aCx = 0.f, aCy = 0.f;               // translation acceleration at centroid (px/frame²)
+    float epsilon = 0.f;                        // angular acceleration (rad/frame²)
+    float sigma_dot = 0.f;                      // scale acceleration (1/frame²)
+    bool has_acceleration = false;
+
+    // Fit quality metrics
+    float velocity_residual_rms = 0.f;
+    int velocity_inlier_count = 0;
+    std::vector<bool> velocity_inliers;         // per-marker inlier flag (for debug viz)
+
     bool valid = false;
 
-    /// Transport velocity+acceleration to a query point using 2D rigid-body kinematics.
-    /// Solves for (vCx, vCy, ω) and (aCx, aCy, ε) from k nearest neighbors.
+    /// Evaluate the global similarity model at a query point.
     /// Returns predicted POSITION offset: Δpos = v*dt + 0.5*a*dt²
-    cv::Point2f transport_predict(const cv::Point2f& query,
-                                   float dt = 1.f, int k = 5) const;
+    cv::Point2f transport_predict(const cv::Point2f& query, float dt = 1.f) const;
 };
 
 struct TrackingState

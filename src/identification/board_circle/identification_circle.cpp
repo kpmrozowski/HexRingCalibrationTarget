@@ -5,6 +5,8 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <numeric>
+#include <random>
 #include <set>
 
 #include <spdlog/spdlog.h>
@@ -583,131 +585,213 @@ using circlegrid::HungarianTrackingResult;
 using circlegrid::ORBMotionField;
 using circlegrid::BlobVelocityField;
 
-/// Helper: solve rigid-body model (vCx, vCy, ω) from neighbor velocities
-static bool solve_rigid_body_2d(const std::vector<cv::Point2f>& positions,
+/// Helper: solve similarity model (vCx, vCy, ω, σ) from marker velocities via SVD least-squares.
+/// Equations: v_i = v_C + ω × r_i + σ · r_i
+///   vx_i = vCx - ω*dy_i + σ*dx_i
+///   vy_i = vCy + ω*dx_i + σ*dy_i
+/// 4 unknowns, 2 equations per marker → minimum 2 markers.
+static bool solve_similarity_2d(const std::vector<cv::Point2f>& positions,
                                  const std::vector<cv::Point2f>& velocities,
-                                 const std::vector<size_t>& neighbor_indices,
+                                 const std::vector<size_t>& indices,
                                  int count,
                                  const cv::Point2f& centroid,
-                                 float& vCx, float& vCy, float& omega)
+                                 float& vCx, float& vCy, float& omega, float& sigma)
 {
-    cv::Mat A(2 * count, 3, CV_32F);
+    cv::Mat A(2 * count, 4, CV_32F);
     cv::Mat b(2 * count, 1, CV_32F);
 
     for (int i = 0; i < count; ++i)
     {
-        const auto& p = positions[neighbor_indices[i]];
-        const auto& v = velocities[neighbor_indices[i]];
+        const auto& p = positions[indices[i]];
+        const auto& v = velocities[indices[i]];
         const float dx = p.x - centroid.x;
         const float dy = p.y - centroid.y;
 
+        // vx_i = vCx - ω*dy + σ*dx
         A.at<float>(2*i, 0)     = 1.f;
         A.at<float>(2*i, 1)     = 0.f;
         A.at<float>(2*i, 2)     = -dy;
+        A.at<float>(2*i, 3)     = dx;
         b.at<float>(2*i, 0)     = v.x;
 
+        // vy_i = vCy + ω*dx + σ*dy
         A.at<float>(2*i+1, 0)   = 0.f;
         A.at<float>(2*i+1, 1)   = 1.f;
         A.at<float>(2*i+1, 2)   = dx;
+        A.at<float>(2*i+1, 3)   = dy;
         b.at<float>(2*i+1, 0)   = v.y;
     }
 
     cv::Mat params;
     cv::solve(A, b, params, cv::DECOMP_SVD);
-    vCx = params.at<float>(0);
-    vCy = params.at<float>(1);
+    vCx   = params.at<float>(0);
+    vCy   = params.at<float>(1);
     omega = params.at<float>(2);
+    sigma = params.at<float>(3);
     return true;
 }
 
-cv::Point2f BlobVelocityField::transport_predict(const cv::Point2f& query,
-                                                  float dt, int k) const
+/// Compute velocity residual for a single marker given the similarity model
+static float velocity_residual(const cv::Point2f& pos, const cv::Point2f& vel,
+                                const cv::Point2f& centroid,
+                                float vCx, float vCy, float omega, float sigma)
 {
-    if (!valid || positions.empty()) return {0.f, 0.f};
+    const float dx = pos.x - centroid.x;
+    const float dy = pos.y - centroid.y;
+    const float pred_vx = vCx - omega * dy + sigma * dx;
+    const float pred_vy = vCy + omega * dx + sigma * dy;
+    const float ex = vel.x - pred_vx;
+    const float ey = vel.y - pred_vy;
+    return std::sqrt(ex * ex + ey * ey);
+}
 
-    // Find k nearest anchors to query
-    struct ND { float dist; size_t idx; };
-    std::vector<ND> neighbors;
-    neighbors.reserve(positions.size());
-    for (size_t i = 0; i < positions.size(); ++i)
+/// Fit similarity model (vCx, vCy, ω, σ) from all markers using RANSAC.
+/// Uses 8-marker samples (16 eqs, 4 unknowns = heavily overdetermined) for robust hypotheses.
+/// Falls back to direct solve if fewer than 8 markers available.
+static bool fit_similarity_ransac(const std::vector<cv::Point2f>& positions,
+                                   const std::vector<cv::Point2f>& velocities,
+                                   const cv::Point2f& centroid,
+                                   float inlier_threshold,
+                                   int max_iterations,
+                                   float& out_vCx, float& out_vCy, float& out_omega,
+                                   float& out_sigma,
+                                   std::vector<bool>& out_inliers,
+                                   float& out_rms)
+{
+    const int n = static_cast<int>(positions.size());
+    if (n < 2) return false;
+
+    out_inliers.assign(n, false);
+    out_rms = std::numeric_limits<float>::max();
+    out_sigma = 0.f;
+
+    constexpr int kSampleSize = 8;
+
+    // If fewer markers than sample size, solve directly from all (no RANSAC)
+    if (n <= kSampleSize)
     {
-        const float d = static_cast<float>(cv::norm(query - positions[i]));
-        neighbors.push_back({d, i});
+        std::vector<size_t> all_idx(n);
+        std::iota(all_idx.begin(), all_idx.end(), 0);
+        solve_similarity_2d(positions, velocities, all_idx, n, centroid,
+                            out_vCx, out_vCy, out_omega, out_sigma);
+        float rms_sum = 0.f;
+        for (int i = 0; i < n; ++i)
+        {
+            const float r = velocity_residual(positions[i], velocities[i], centroid,
+                                               out_vCx, out_vCy, out_omega, out_sigma);
+            out_inliers[i] = (r < inlier_threshold);
+            rms_sum += r * r;
+        }
+        out_rms = std::sqrt(rms_sum / static_cast<float>(n));
+        return true;
     }
 
-    const int actual_k = std::min(k, static_cast<int>(neighbors.size()));
-    if (actual_k < 2) return {0.f, 0.f};
+    // RANSAC: sample 8 markers per iteration (16 eqs for 4 unknowns = overdetermined)
+    // With 8-marker samples and 80% inlier rate: P(all inliers) = 0.8^8 ≈ 0.17
+    // Need ~200 iterations for 99.99% success at 70% inlier rate
+    std::mt19937 rng(static_cast<unsigned>(n * 31 + 17));  // deterministic seed
+    std::uniform_int_distribution<int> dist(0, n - 1);
 
-    std::partial_sort(neighbors.begin(), neighbors.begin() + actual_k, neighbors.end(),
-                      [](const ND& a, const ND& b) { return a.dist < b.dist; });
+    int best_inlier_count = 0;
+    float best_vCx = 0.f, best_vCy = 0.f, best_omega = 0.f, best_sigma = 0.f;
 
-    std::vector<size_t> nbr_indices(actual_k);
-    cv::Point2f centroid(0.f, 0.f);
-    for (int i = 0; i < actual_k; ++i)
+    for (int iter = 0; iter < max_iterations; ++iter)
     {
-        nbr_indices[i] = neighbors[i].idx;
-        centroid += positions[nbr_indices[i]];
+        // Sample kSampleSize distinct markers
+        std::vector<size_t> sample;
+        sample.reserve(kSampleSize);
+        while (static_cast<int>(sample.size()) < kSampleSize)
+        {
+            const auto idx = static_cast<size_t>(dist(rng));
+            if (std::find(sample.begin(), sample.end(), idx) == sample.end())
+                sample.push_back(idx);
+        }
+
+        float vCx_h, vCy_h, omega_h, sigma_h;
+        solve_similarity_2d(positions, velocities, sample, kSampleSize, centroid,
+                            vCx_h, vCy_h, omega_h, sigma_h);
+
+        int inlier_count = 0;
+        for (int j = 0; j < n; ++j)
+        {
+            if (velocity_residual(positions[j], velocities[j], centroid,
+                                   vCx_h, vCy_h, omega_h, sigma_h) < inlier_threshold)
+            {
+                ++inlier_count;
+            }
+        }
+
+        if (inlier_count > best_inlier_count)
+        {
+            best_inlier_count = inlier_count;
+            best_vCx = vCx_h;
+            best_vCy = vCy_h;
+            best_omega = omega_h;
+            best_sigma = sigma_h;
+        }
     }
-    centroid /= static_cast<float>(actual_k);
 
-    // Solve velocity rigid-body model: v_i = v_C + ω × r_i
-    float vCx, vCy, omega;
-    solve_rigid_body_2d(positions, velocities, nbr_indices, actual_k, centroid, vCx, vCy, omega);
+    // Collect inlier indices and refit
+    std::vector<size_t> inlier_indices;
+    inlier_indices.reserve(best_inlier_count);
+    for (int j = 0; j < n; ++j)
+    {
+        if (velocity_residual(positions[j], velocities[j], centroid,
+                               best_vCx, best_vCy, best_omega, best_sigma) < inlier_threshold)
+        {
+            inlier_indices.push_back(static_cast<size_t>(j));
+        }
+    }
 
-    // Transport velocity to query point: v_q = v_C + ω × (q - C)
+    if (inlier_indices.size() < 2) return false;
+
+    // Refit from all inliers
+    solve_similarity_2d(positions, velocities, inlier_indices,
+                        static_cast<int>(inlier_indices.size()), centroid,
+                        out_vCx, out_vCy, out_omega, out_sigma);
+
+    // Compute per-marker residuals and RMS
+    float rms_sum = 0.f;
+    int inlier_count_final = 0;
+    for (int j = 0; j < n; ++j)
+    {
+        const float r = velocity_residual(positions[j], velocities[j], centroid,
+                                           out_vCx, out_vCy, out_omega, out_sigma);
+        out_inliers[j] = (r < inlier_threshold);
+        if (out_inliers[j])
+        {
+            rms_sum += r * r;
+            ++inlier_count_final;
+        }
+    }
+    out_rms = inlier_count_final > 0
+        ? std::sqrt(rms_sum / static_cast<float>(inlier_count_final))
+        : 0.f;
+    return true;
+}
+
+/// Evaluate the pre-fitted global similarity model at a query point.
+cv::Point2f BlobVelocityField::transport_predict(const cv::Point2f& query, float dt) const
+{
+    if (!valid) return {0.f, 0.f};
+
     const float rqx = query.x - centroid.x;
     const float rqy = query.y - centroid.y;
-    const float vqx = vCx - omega * rqy;
-    const float vqy = vCy + omega * rqx;
 
-    // Solve acceleration rigid-body model if accelerations available:
-    // a_i = a_C + ε × r_i + ω × (ω × r_i)
-    // Rearranging: a_i - (-ω²*r_i) = a_C + ε × r_i
-    // So we solve: a_corr_i = a_C + ε × r_i where a_corr_i = a_i + ω²*r_i (remove centripetal)
+    // v_q = v_C + ω × r_q + σ · r_q
+    const float vqx = vCx - omega * rqy + sigma * rqx;
+    const float vqy = vCy + omega * rqx + sigma * rqy;
+
     float aqx = 0.f, aqy = 0.f;
-    if (!accelerations.empty() && accelerations.size() == positions.size())
+    if (has_acceleration)
     {
-        // Check if any neighbor has nonzero acceleration
-        bool has_acc = false;
-        for (int i = 0; i < actual_k; ++i)
-        {
-            if (cv::norm(accelerations[nbr_indices[i]]) > 0.01f) { has_acc = true; break; }
-        }
-
-        if (has_acc)
-        {
-            // Remove centripetal from measured acceleration to get corrected acceleration
-            // a_corr_i = a_measured_i + ω² * r_i (centripetal is -ω²*r, so add ω²*r to remove it)
-            std::vector<cv::Point2f> acc_corrected(actual_k);
-            for (int i = 0; i < actual_k; ++i)
-            {
-                const auto& p = positions[nbr_indices[i]];
-                const float rx = p.x - centroid.x;
-                const float ry = p.y - centroid.y;
-                acc_corrected[i] = accelerations[nbr_indices[i]] + cv::Point2f(omega * omega * rx, omega * omega * ry);
-            }
-
-            // Solve: a_corr_i = a_C + ε × r_i → same structure as velocity
-            float aCx, aCy, epsilon;
-            // Build temporary vectors for the solver
-            std::vector<cv::Point2f> temp_pos(actual_k), temp_acc(actual_k);
-            std::vector<size_t> temp_idx(actual_k);
-            for (int i = 0; i < actual_k; ++i)
-            {
-                temp_pos[i] = positions[nbr_indices[i]];
-                temp_acc[i] = acc_corrected[i];
-                temp_idx[i] = static_cast<size_t>(i);
-            }
-            solve_rigid_body_2d(temp_pos, temp_acc, temp_idx, actual_k, centroid, aCx, aCy, epsilon);
-
-            // Transport acceleration to query: a_q = a_C + ε × r_q + ω×(ω×r_q)
-            // In 2D: ε × r = (-ε*ry, ε*rx), ω×(ω×r) = -ω²*r
-            aqx = aCx + (-epsilon * rqy) + (-omega * omega * rqx);
-            aqy = aCy + ( epsilon * rqx) + (-omega * omega * rqy);
-        }
+        // a_q = a_C + ε × r_q + σ_dot · r_q - (ω² - σ²) · r_q
+        // The (ω²-σ²) term combines centripetal and scale effects
+        const float omega_sq_minus_sigma_sq = omega * omega - sigma * sigma;
+        aqx = aCx - epsilon * rqy + sigma_dot * rqx - omega_sq_minus_sigma_sq * rqx;
+        aqy = aCy + epsilon * rqx + sigma_dot * rqy - omega_sq_minus_sigma_sq * rqy;
     }
 
-    // Predicted displacement: Δpos = v*dt + 0.5*a*dt²
     return {vqx * dt + 0.5f * aqx * dt * dt,
             vqy * dt + 0.5f * aqy * dt * dt};
 }
@@ -735,6 +819,122 @@ void TrackingState::update(const std::vector<base::MarkerCoding>& markers, const
     ++frame_counter_;
 }
 
+/// Helper: fit global similarity model to a BlobVelocityField (velocity + optional acceleration).
+/// After fitting, outlier velocities are replaced with model-predicted values (smoothing).
+static void fit_global_model(BlobVelocityField& field)
+{
+    const int n = static_cast<int>(field.positions.size());
+    if (n < 2) { field.valid = false; return; }
+
+    // Compute centroid
+    field.centroid = {0.f, 0.f};
+    for (const auto& p : field.positions) field.centroid += p;
+    field.centroid /= static_cast<float>(n);
+
+    // RANSAC fit for similarity velocity model: (vCx, vCy, ω, σ)
+    // 8-marker samples need ~200 iterations for 99% success at 70% inlier rate
+    const bool ok = fit_similarity_ransac(
+        field.positions, field.velocities, field.centroid,
+        3.0f,  // inlier threshold (px)
+        200,   // max iterations (8-marker samples)
+        field.vCx, field.vCy, field.omega, field.sigma,
+        field.velocity_inliers, field.velocity_residual_rms);
+
+    if (!ok) { field.valid = false; return; }
+    field.velocity_inlier_count = static_cast<int>(
+        std::count(field.velocity_inliers.begin(), field.velocity_inliers.end(), true));
+    field.valid = field.velocity_inlier_count >= 2;
+
+    // Smooth outlier velocities: replace with model-predicted values.
+    // This removes motion peaks from wrong track assignments.
+    int smoothed_count = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (field.velocity_inliers[i]) continue;
+
+        const float dx = field.positions[i].x - field.centroid.x;
+        const float dy = field.positions[i].y - field.centroid.y;
+        const cv::Point2f model_vel(field.vCx - field.omega * dy + field.sigma * dx,
+                                     field.vCy + field.omega * dx + field.sigma * dy);
+        const float residual = static_cast<float>(cv::norm(field.velocities[i] - model_vel));
+        field.velocities[i] = model_vel;
+        field.velocity_inliers[i] = true;
+        ++smoothed_count;
+
+        spdlog::debug("Motion field: smoothed outlier idx={} residual={:.1f}px → model vel=({:.1f},{:.1f})",
+                       i, residual, model_vel.x, model_vel.y);
+    }
+    if (smoothed_count > 0)
+    {
+        field.velocity_inlier_count = n;
+        float rms_sum = 0.f;
+        for (int i = 0; i < n; ++i)
+        {
+            const float r = velocity_residual(field.positions[i], field.velocities[i],
+                                               field.centroid, field.vCx, field.vCy,
+                                               field.omega, field.sigma);
+            rms_sum += r * r;
+        }
+        field.velocity_residual_rms = std::sqrt(rms_sum / static_cast<float>(n));
+    }
+
+    // Acceleration fit: use markers with nonzero acceleration
+    // Remove centripetal+scale terms, then RANSAC fit (aCx, aCy, ε, σ_dot)
+    if (!field.accelerations.empty() && field.accelerations.size() == field.positions.size())
+    {
+        std::vector<cv::Point2f> acc_positions;
+        std::vector<cv::Point2f> acc_corrected;
+        const float omega_sq_minus_sigma_sq = field.omega * field.omega - field.sigma * field.sigma;
+        for (int i = 0; i < n; ++i)
+        {
+            if (cv::norm(field.accelerations[i]) < 0.01f) continue;
+
+            const float rx = field.positions[i].x - field.centroid.x;
+            const float ry = field.positions[i].y - field.centroid.y;
+            // Remove centripetal+scale: a_corr = a_measured + (ω²-σ²)·r
+            acc_positions.push_back(field.positions[i]);
+            acc_corrected.push_back(field.accelerations[i]
+                + cv::Point2f(omega_sq_minus_sigma_sq * rx, omega_sq_minus_sigma_sq * ry));
+        }
+
+        if (static_cast<int>(acc_positions.size()) >= 5)
+        {
+            std::vector<bool> acc_inliers;
+            float acc_rms;
+            float acc_sigma;  // this is σ_dot for acceleration
+            const bool acc_ok = fit_similarity_ransac(
+                acc_positions, acc_corrected, field.centroid,
+                5.0f,  // slightly larger threshold for acceleration noise
+                100,   // 8-marker samples
+                field.aCx, field.aCy, field.epsilon, acc_sigma,
+                acc_inliers, acc_rms);
+            field.sigma_dot = acc_sigma;
+            field.has_acceleration = acc_ok;
+
+            // Smooth outlier accelerations with model-predicted values
+            if (acc_ok)
+            {
+                for (int i = 0; i < n; ++i)
+                {
+                    if (cv::norm(field.accelerations[i]) < 0.01f) continue;
+                    const float rx = field.positions[i].x - field.centroid.x;
+                    const float ry = field.positions[i].y - field.centroid.y;
+                    const cv::Point2f a_corr = field.accelerations[i]
+                        + cv::Point2f(omega_sq_minus_sigma_sq * rx, omega_sq_minus_sigma_sq * ry);
+                    const cv::Point2f model_a_corr(field.aCx - field.epsilon * ry + field.sigma_dot * rx,
+                                                    field.aCy + field.epsilon * rx + field.sigma_dot * ry);
+                    if (cv::norm(a_corr - model_a_corr) > 5.0f)
+                    {
+                        field.accelerations[i] = cv::Point2f(
+                            model_a_corr.x - omega_sq_minus_sigma_sq * rx,
+                            model_a_corr.y - omega_sq_minus_sigma_sq * ry);
+                    }
+                }
+            }
+        }
+    }
+}
+
 void TrackingState::update_blob_velocity_fields(const std::vector<base::MarkerCoding>& curr_markers)
 {
     forward_blob_field_ = {};
@@ -742,13 +942,8 @@ void TrackingState::update_blob_velocity_fields(const std::vector<base::MarkerCo
 
     if (!has_previous_ || prev_global_ids_.empty()) return;
 
-    // Use IDENTIFIED marker tracks for exact velocity computation.
-    // For each marker that was identified in BOTH the previous and current frame,
-    // compute the displacement vector. This is exact (no blob matching ambiguity).
-    //
-    // We compare prev_markers_/prev_global_ids_ (previous frame's identified markers)
-    // with the current curr_markers and the CURRENT tracks_ (which still hold previous positions).
-
+    // Collect per-marker velocities from identified tracks.
+    // Each track that was seen on consecutive frames gives an exact velocity.
     for (const auto& [gid, track] : tracks_)
     {
         if (track.history_count < 2) continue;
@@ -763,12 +958,10 @@ void TrackingState::update_blob_velocity_fields(const std::vector<base::MarkerCo
         const cv::Point2f vel = curr_pos - prev_pos;  // velocity (px/frame, dt=1)
 
         // Acceleration from central difference: a(t-1) = [s(t) - 2s(t-1) + s(t-2)] / dt²
-        // With dt=1 frame: a = s(t) - 2*s(t-1) + s(t-2)
         cv::Point2f acc(0.f, 0.f);
         if (track.history_count >= 3)
         {
             const cv::Point2f pp_pos = track.position_history[track.history_count - 3];
-            // Central difference at t-1: a = curr - 2*prev + pp
             acc = curr_pos - 2.f * prev_pos + pp_pos;
         }
 
@@ -783,11 +976,22 @@ void TrackingState::update_blob_velocity_fields(const std::vector<base::MarkerCo
         backward_blob_field_.accelerations.push_back(acc);
     }
 
-    forward_blob_field_.valid = forward_blob_field_.positions.size() >= 5;
-    backward_blob_field_.valid = backward_blob_field_.positions.size() >= 5;
+    // Fit global rigid-body model via RANSAC for both fields
+    fit_global_model(forward_blob_field_);
+    fit_global_model(backward_blob_field_);
 
     if (forward_blob_field_.valid)
-        spdlog::debug("Blob velocity field: {} tracked markers", forward_blob_field_.positions.size());
+    {
+        spdlog::debug("Blob velocity field: {} markers, inl={}/{}, v=({:.1f},{:.1f}), "
+                      "ω={:.4f}rad/f, σ={:.5f}/f, rms={:.2f}px, acc={}",
+                      forward_blob_field_.positions.size(),
+                      forward_blob_field_.velocity_inlier_count,
+                      forward_blob_field_.positions.size(),
+                      forward_blob_field_.vCx, forward_blob_field_.vCy,
+                      forward_blob_field_.omega, forward_blob_field_.sigma,
+                      forward_blob_field_.velocity_residual_rms,
+                      forward_blob_field_.has_acceleration ? "yes" : "no");
+    }
 }
 
 void TrackingState::clear()
@@ -1193,16 +1397,22 @@ HungarianTrackingResult circlegrid::identify_with_hungarian_tracking(const Track
             result.max_cost = max_cost_val;
 
             // Bidirectional blob-velocity acceptance check.
-            // For each assigned marker, use rigid-body velocity transport from
-            // neighboring blobs to predict position in BOTH directions:
-            //   Forward:  prev_pos + v_forward(prev_pos) → should ≈ curr_pos
-            //   Backward: curr_pos - v_backward(curr_pos) → should ≈ prev_pos
-            // If either check fails (distance > 1% of shorter image edge), reject.
+            // Only apply on near-square grids where row/col swaps actually occur.
+            // Non-square grids (5x7, aspect>1.3) don't suffer from orientation ambiguity.
+            const float board_width = board.is_asymetric_
+                ? static_cast<float>((2 * (board.cols_ - 1) + 1) * board.spacing_)
+                : static_cast<float>((board.cols_ - 1) * board.spacing_);
+            const float board_height = static_cast<float>((board.rows_ - 1) * board.spacing_);
+            const float board_aspect = std::max(board_width, board_height)
+                / std::max(1.f, std::min(board_width, board_height));
+            const bool board_is_near_square = board_aspect < 1.3f;
+
             const float img_short_edge = static_cast<float>(
                 std::min(state.prev_image_.cols, state.prev_image_.rows));
-            const float tolerance = 0.08f * img_short_edge;  // 8% of shorter edge (~48px for 600px)
+            const float absolute_cap = 0.05f * img_short_edge;
 
-            if (state.forward_blob_field_.valid && state.backward_blob_field_.valid && tolerance > 0.f)
+            if (board_is_near_square &&
+                state.forward_blob_field_.valid && state.backward_blob_field_.valid && absolute_cap > 0.f)
             {
                 for (size_t k = 0; k < matches.size(); ++k)
                 {
@@ -1228,11 +1438,17 @@ HungarianTrackingResult circlegrid::identify_with_hungarian_tracking(const Track
                     const cv::Point2f predicted_prev = curr_pos - v_bwd;
                     const float bwd_err = static_cast<float>(cv::norm(predicted_prev - prev_pos));
 
+                    // Displacement-proportional tolerance: prediction error scales with
+                    // motion speed (acceleration, lens distortion, direction changes).
+                    // Allow 50% of predicted displacement, minimum 15px, capped at 5% edge.
+                    const float displacement = static_cast<float>(cv::norm(v_fwd));
+                    const float tolerance = std::min(std::max(0.5f * displacement, 15.f), absolute_cap);
+
                     if (fwd_err > tolerance || bwd_err > tolerance)
                     {
                         spdlog::info("Blob-velocity reject: gid {} fwd_err={:.1f} bwd_err={:.1f} "
-                                     "(tol={:.1f}) prev=({:.0f},{:.0f}) curr=({:.0f},{:.0f})",
-                                     gid, fwd_err, bwd_err, tolerance,
+                                     "(tol={:.1f} disp={:.1f}) prev=({:.0f},{:.0f}) curr=({:.0f},{:.0f})",
+                                     gid, fwd_err, bwd_err, tolerance, displacement,
                                      prev_pos.x, prev_pos.y, curr_pos.x, curr_pos.y);
                         result.global_ids[curr_idx] = -1;
                         --result.matched_count;
