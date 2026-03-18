@@ -1612,18 +1612,96 @@ void circlegrid::identify_unmatched_by_local_homography(std::vector<base::Marker
         }
     }
 
-    if (board_pts.size() < 4)
+    // Require sufficient seed markers for reliable homography.
+    // Near-square grids need more seeds because the homography is prone to
+    // fitting swapped configurations. Non-square grids are safer with fewer seeds.
+    const float bw = board.is_asymetric_
+        ? static_cast<float>((2 * (board.cols_ - 1) + 1) * board.spacing_)
+        : static_cast<float>((board.cols_ - 1) * board.spacing_);
+    const float bh = static_cast<float>((board.rows_ - 1) * board.spacing_);
+    const float board_aspect = std::max(bw, bh) / std::max(1.f, std::min(bw, bh));
+    const int total_markers = board.rows_ * board.cols_;
+    // Near-square: 40% of total. Non-square: fixed 8.
+    const int min_seeds = board_aspect < 1.3f
+        ? std::max(8, static_cast<int>(total_markers * 0.4f))
+        : 8;
+    if (static_cast<int>(board_pts.size()) < min_seeds)
     {
-        spdlog::debug("Local homography: only {} identified markers, need 4+", board_pts.size());
+        spdlog::debug("Local homography: only {} identified markers, need {}+ (aspect={:.1f})",
+                       board_pts.size(), min_seeds, board_aspect);
         return;
     }
 
-    // Compute global homography: board -> image
-    const cv::Mat H_global = cv::findHomography(board_pts, image_pts, cv::RANSAC, 5.0);
+    // Compute global RANSAC homography: board -> image
+    cv::Mat H_global = cv::findHomography(board_pts, image_pts, cv::RANSAC, 5.0);
     if (H_global.empty())
     {
         spdlog::debug("Local homography: global homography failed");
         return;
+    }
+
+    // Validate seed markers: compute reproj error for each identified marker against H.
+    // Remove seeds with high reproj error (these have wrong gids and corrupt H).
+    {
+        std::vector<float> seed_reproj(board_pts.size());
+        for (size_t j = 0; j < board_pts.size(); ++j)
+        {
+            const cv::Mat pt = (cv::Mat_<double>(3, 1) << board_pts[j].x, board_pts[j].y, 1.0);
+            const cv::Mat proj = H_global * pt;
+            const cv::Point2f projected(static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
+                                         static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+            seed_reproj[j] = static_cast<float>(cv::norm(projected - image_pts[j]));
+        }
+
+        // Compute median reproj for threshold
+        std::vector<float> sorted_reproj = seed_reproj;
+        std::sort(sorted_reproj.begin(), sorted_reproj.end());
+        const float median_reproj = sorted_reproj[sorted_reproj.size() / 2];
+        const float outlier_threshold = std::max(3.f * median_reproj, 5.f);
+
+        // Remove outlier seeds and rebuild arrays
+        std::vector<cv::Point2f> clean_board, clean_image;
+        std::vector<int> clean_indices;
+        int removed = 0;
+        for (size_t j = 0; j < board_pts.size(); ++j)
+        {
+            if (seed_reproj[j] <= outlier_threshold)
+            {
+                clean_board.push_back(board_pts[j]);
+                clean_image.push_back(image_pts[j]);
+                clean_indices.push_back(identified_indices[j]);
+            }
+            else
+            {
+                // Unset the bad seed marker
+                markers[identified_indices[j]].global_id_ = -1;
+                used_global_ids.erase(markers[identified_indices[j]].global_id_);
+                ++removed;
+            }
+        }
+
+        if (removed > 0)
+        {
+            spdlog::info("Local homography: removed {} outlier seed markers (median_reproj={:.1f}px, threshold={:.1f}px)",
+                          removed, median_reproj, outlier_threshold);
+            board_pts = std::move(clean_board);
+            image_pts = std::move(clean_image);
+            identified_indices = std::move(clean_indices);
+
+            if (static_cast<int>(board_pts.size()) < min_seeds)
+            {
+                spdlog::debug("Local homography: only {} clean seeds remaining, need 8+", board_pts.size());
+                return;
+            }
+
+            // Recompute H from cleaned seeds
+            H_global = cv::findHomography(board_pts, image_pts, cv::RANSAC, 5.0);
+            if (H_global.empty())
+            {
+                spdlog::debug("Local homography: recomputed homography failed");
+                return;
+            }
+        }
     }
 
     // Pre-compute all expected board positions
@@ -1712,8 +1790,17 @@ void circlegrid::identify_unmatched_by_local_homography(std::vector<base::Marker
             }
         }
 
-        // Try local homography (4 closest identified neighbors)
-        if (best_gid < 0 && identified_indices.size() >= 4)
+        // Try local homography (4 closest identified neighbors).
+        // Disabled for near-square grids: local H from 4 neighbors propagates
+        // errors when seeds have wrong gids (common on 10x7 boards).
+        const float bw = board.is_asymetric_
+            ? static_cast<float>((2 * (board.cols_ - 1) + 1) * board.spacing_)
+            : static_cast<float>((board.cols_ - 1) * board.spacing_);
+        const float bh = static_cast<float>((board.rows_ - 1) * board.spacing_);
+        const float board_aspect = std::max(bw, bh) / std::max(1.f, std::min(bw, bh));
+        const bool local_h_allowed = board_aspect >= 1.3f;  // only for non-square grids
+
+        if (best_gid < 0 && local_h_allowed && identified_indices.size() >= 4)
         {
             std::vector<std::pair<float, int>> neighbor_dists;
             for (size_t k = 0; k < identified_indices.size(); ++k)

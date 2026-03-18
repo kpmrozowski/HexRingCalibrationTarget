@@ -1302,25 +1302,63 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
             const cv::Mat H_q = cv::findHomography(board_pts_q, image_pts_q, cv::RANSAC, 5.0);
             if (!H_q.empty())
             {
-                float sum_err = 0.f, max_err = 0.f;
+                // Compute per-marker reproj error
+                std::vector<float> reproj_errors(board_pts_q.size());
                 for (size_t j = 0; j < board_pts_q.size(); ++j)
                 {
                     const cv::Mat pt = (cv::Mat_<double>(3,1) << board_pts_q[j].x, board_pts_q[j].y, 1.0);
                     const cv::Mat proj = H_q * pt;
                     const cv::Point2f projected(static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
                                                  static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
-                    const float err = static_cast<float>(cv::norm(projected - image_pts_q[j]));
-                    homography_reproj_error[ring_indices_q[j]] = err;
-                    sum_err += err;
-                    max_err = std::max(max_err, err);
+                    reproj_errors[j] = static_cast<float>(cv::norm(projected - image_pts_q[j]));
+                    homography_reproj_error[ring_indices_q[j]] = reproj_errors[j];
                 }
-                frame_reproj_mean = sum_err / static_cast<float>(board_pts_q.size());
+
+                // Compute median for outlier threshold
+                std::vector<float> sorted_reproj = reproj_errors;
+                std::sort(sorted_reproj.begin(), sorted_reproj.end());
+                const float median_reproj = sorted_reproj[sorted_reproj.size() / 2];
+                // Outlier threshold: 3× median, minimum 10px (accounts for lens distortion)
+                const float outlier_thresh = std::max(3.f * median_reproj, 10.f);
+
+                // Remove gross outliers (clear misidentifications) — iterative
+                int outliers_removed = 0;
+                for (size_t j = 0; j < board_pts_q.size(); ++j)
+                {
+                    if (reproj_errors[j] > outlier_thresh)
+                    {
+                        spdlog::debug("image {}: reproj outlier: gid {} reproj={:.1f}px > {:.1f}px, unsetting",
+                                       image_idx, rings[ring_indices_q[j]].global_id_,
+                                       reproj_errors[j], outlier_thresh);
+                        rings[ring_indices_q[j]].global_id_ = -1;
+                        ++outliers_removed;
+                    }
+                }
+
+                // Recompute frame stats after outlier removal
+                float sum_err = 0.f, max_err = 0.f;
+                int valid_count = 0;
+                for (size_t j = 0; j < board_pts_q.size(); ++j)
+                {
+                    if (rings[ring_indices_q[j]].global_id_ < 0) continue;
+                    sum_err += reproj_errors[j];
+                    max_err = std::max(max_err, reproj_errors[j]);
+                    ++valid_count;
+                }
+                frame_reproj_mean = valid_count > 0 ? sum_err / static_cast<float>(valid_count) : -1.f;
                 frame_reproj_max = max_err;
 
-                if (frame_reproj_mean > 5.0f)
+                if (outliers_removed > 0)
+                {
+                    spdlog::info("image {}: removed {} reproj outliers (median={:.1f}px, thresh={:.1f}px), "
+                                 "remaining: mean={:.2f}px max={:.2f}px ({} markers)",
+                                 image_idx, outliers_removed, median_reproj, outlier_thresh,
+                                 frame_reproj_mean, frame_reproj_max, valid_count);
+                }
+                else if (frame_reproj_mean > 5.0f)
                 {
                     spdlog::warn("image {}: HIGH homography reprojection error: mean={:.2f}px max={:.2f}px "
-                                 "({} markers)", image_idx, frame_reproj_mean, frame_reproj_max, board_pts_q.size());
+                                 "({} markers)", image_idx, frame_reproj_mean, frame_reproj_max, valid_count);
                 }
             }
         }
@@ -1462,19 +1500,12 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
         return make_failed_result(input, binarized, inverted_binarization, rings);
     }
 
-    // Quality gate: reject frames with high homography reprojection error.
-    // These indicate gross detection errors (misidentified markers) that would
-    // corrupt PnP poses and pollute the IMU-camera optimizer.
-    constexpr float kMaxFrameReprojMean = 5.0f;
-    if (frame_reproj_mean > kMaxFrameReprojMean && frame_reproj_mean > 0.f)
+    // Quality monitoring: log frames with high homography reprojection error
+    // but do NOT reject — the sliding-window re-identification will fix these.
+    if (frame_reproj_mean > 5.0f && frame_reproj_mean > 0.f)
     {
-        spdlog::warn("image {}: REJECTED: homography reproj mean={:.2f}px > {:.1f}px threshold "
-                     "(max={:.2f}px, {} markers), marking as failed",
-                     image_idx, frame_reproj_mean, kMaxFrameReprojMean,
-                     frame_reproj_max, identified_markers);
-        append_tracking_stats_csv(image_idx, static_cast<int>(coding_markers.size()), identified_markers,
-                                  "rejected_reproj", frame_reproj_mean, frame_reproj_max);
-        return make_failed_result(input, binarized, inverted_binarization, rings);
+        spdlog::warn("image {}: HIGH homography reproj mean={:.2f}px (max={:.2f}px, {} markers)",
+                     image_idx, frame_reproj_mean, frame_reproj_max, identified_markers);
     }
 
     spdlog::info("image {}: Final identification: {} / {} markers (method: {})", image_idx, identified_markers,
