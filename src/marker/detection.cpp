@@ -7,6 +7,7 @@
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
 
 #include <io/debug.hpp>
 
@@ -765,6 +766,21 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
     // Orientation ambiguity is now resolved inside test_find_circles_grid via discrete optimization
     // (trying all 4 orientations and picking the one with lowest homography reprojection error).
 
+    // Store findCirclesGrid positions as trusted reference for swap detection
+    if (primary_succeeded)
+    {
+        const int total = board.rows_ * board.cols_;
+        tracker_state.last_fcg_positions_.assign(total, cv::Point2f(-1, -1));
+        for (size_t i = 0; i < coding_markers.size() && i < global_ids.size(); ++i)
+        {
+            if (global_ids[i] >= 0 && global_ids[i] < total)
+                tracker_state.last_fcg_positions_[global_ids[i]] =
+                    cv::Point2f(coding_markers[i].col_, coding_markers[i].row_);
+        }
+        tracker_state.last_fcg_frame_ = image_idx;
+        spdlog::debug("image {}: stored findCirclesGrid reference positions", image_idx);
+    }
+
     // Count how many markers findCirclesGrid actually identified
     const int primary_identified = primary_succeeded
                                        ? static_cast<int>(std::count_if(global_ids.begin(), global_ids.end(),
@@ -894,6 +910,36 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
         rings.back().global_id_ = global_ids[i];
     }
 
+    // Populate debug prediction vectors for visualization.
+    // For each identified marker that has a track, show where the blob velocity field
+    // predicts it should be: query forward field at the PREVIOUS position (where the field
+    // is anchored), then draw from the current position to the predicted position.
+    tracker_state.debug_prediction_vectors_.clear();
+    const bool field_valid = tracker_state.forward_blob_field_.valid;
+    int vec_count = 0;
+    if (field_valid)
+    {
+        for (const auto& ring : rings)
+        {
+            if (ring.global_id_ < 0) continue;
+            const cv::Point2f curr_pos(ring.col_, ring.row_);
+
+            // Find this marker's previous position from the track
+            auto track_it = tracker_state.tracks_.find(ring.global_id_);
+            if (track_it == tracker_state.tracks_.end()) continue;
+            const cv::Point2f prev_pos = track_it->second.last_position;
+
+            // Forward prediction: from previous position, where should the marker go?
+            const cv::Point2f v = tracker_state.forward_blob_field_.transport_predict(prev_pos);
+            const cv::Point2f predicted = prev_pos + v;
+
+            // Draw line from current actual position to where it was predicted to be
+            tracker_state.debug_prediction_vectors_.emplace_back(curr_pos, predicted);
+            ++vec_count;
+        }
+    }
+    spdlog::info("image {}: prediction vectors: field_valid={}, vectors={}", image_idx, field_valid, vec_count);
+
     // Always try to identify unmatched markers using local homography
     const int unidentified_count =
         static_cast<int>(std::count_if(rings.begin(), rings.end(), [](const auto& r) { return r.global_id_ < 0; }));
@@ -918,8 +964,188 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
         }
     }
 
-    // Orientation ambiguity and row swaps are handled by the discrete optimization
-    // in test_find_circles_grid (tries all 4 orientations, picks lowest reprojection error).
+    // Fix individual row swaps using the last findCirclesGrid frame as trusted reference.
+    // Compute a homography from findCirclesGrid reference positions to current frame positions.
+    // For each adjacent-row pair, check if the current assignment or swapped assignment
+    // better matches the projected reference positions.
+    if (!tracker_state.last_fcg_positions_.empty() && identification_method != "findCirclesGrid")
+    {
+        const int total = board.rows_ * board.cols_;
+        const auto& ref = tracker_state.last_fcg_positions_;
+
+        // Use the BOARD MODEL as the reference coordinate system.
+        // Compute homography from board coordinates to current image positions.
+        // The board coordinates are absolute (gid-independent), so even if some
+        // markers have wrong gids, the RANSAC homography will fit the majority correctly.
+        std::vector<cv::Point2f> board_pts_h, image_pts_h;
+        for (const auto& ring : rings)
+        {
+            if (ring.global_id_ < 0 || ring.global_id_ >= total) continue;
+            const int r = ring.global_id_ / board.cols_;
+            const int c = ring.global_id_ % board.cols_;
+            float bx = board.is_asymetric_ ? static_cast<float>((2*c + r%2) * board.spacing_)
+                                            : static_cast<float>(c * board.spacing_);
+            float by = static_cast<float>(r * board.spacing_);
+            board_pts_h.emplace_back(bx, by);
+            image_pts_h.emplace_back(ring.col_, ring.row_);
+        }
+
+        if (static_cast<int>(board_pts_h.size()) >= 8)
+        {
+            // RANSAC homography — robust to outliers (swapped markers)
+            const cv::Mat H = cv::findHomography(board_pts_h, image_pts_h, cv::RANSAC, 5.0);
+            if (!H.empty())
+            {
+                std::unordered_map<int, size_t> gid_to_ring;
+                for (size_t i = 0; i < rings.size(); ++i)
+                    if (rings[i].global_id_ >= 0)
+                        gid_to_ring[rings[i].global_id_] = i;
+
+                // Project a board position through the RANSAC homography
+                auto project_board = [&](int r, int c) -> cv::Point2f {
+                    float bx = board.is_asymetric_ ? static_cast<float>((2*c + r%2) * board.spacing_)
+                                                    : static_cast<float>(c * board.spacing_);
+                    float by = static_cast<float>(r * board.spacing_);
+                    const cv::Mat pt = (cv::Mat_<double>(3,1) << bx, by, 1.0);
+                    const cv::Mat proj = H * pt;
+                    return {static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
+                            static_cast<float>(proj.at<double>(1) / proj.at<double>(2))};
+                };
+
+                int swaps_fixed = 0;
+                for (int r = 0; r < board.rows_ - 1; ++r)
+                {
+                    for (int c = 0; c < board.cols_; ++c)
+                    {
+                        const int gid_a = board.row_and_col_to_id(r, c);
+                        const int gid_b = board.row_and_col_to_id(r + 1, c);
+                        auto it_a = gid_to_ring.find(gid_a);
+                        auto it_b = gid_to_ring.find(gid_b);
+                        if (it_a == gid_to_ring.end() || it_b == gid_to_ring.end()) continue;
+
+                        const cv::Point2f pos_a(rings[it_a->second].col_, rings[it_a->second].row_);
+                        const cv::Point2f pos_b(rings[it_b->second].col_, rings[it_b->second].row_);
+
+                        // Where should (r,c) and (r+1,c) be according to the RANSAC homography?
+                        const cv::Point2f exp_a = project_board(r, c);
+                        const cv::Point2f exp_b = project_board(r + 1, c);
+
+                        const float cost_current = static_cast<float>(
+                            cv::norm(pos_a - exp_a) + cv::norm(pos_b - exp_b));
+                        const float cost_swapped = static_cast<float>(
+                            cv::norm(pos_a - exp_b) + cv::norm(pos_b - exp_a));
+
+                        if (cost_swapped < cost_current * 0.5f)
+                        {
+                            std::swap(rings[it_a->second].global_id_, rings[it_b->second].global_id_);
+                            std::swap(gid_to_ring[gid_a], gid_to_ring[gid_b]);
+                            ++swaps_fixed;
+                            spdlog::debug("image {}: swap row {} col {} (gid {}<->{}), cost {:.1f}→{:.1f}",
+                                          image_idx, r, c, gid_a, gid_b, cost_current, cost_swapped);
+                        }
+                    }
+                }
+                if (swaps_fixed > 0)
+                {
+                    spdlog::info("image {}: fixed {} adjacent-row swaps (fcg-reference)", image_idx, swaps_fixed);
+                }
+            }
+        }
+    }
+
+    // Disappeared-neighbor swap detection: if gid X is assigned to a marker at
+    // approximately the PREVIOUS position of gid Y (adjacent row, same column),
+    // and gid Y is NOT in the current frame, then gid X likely stole gid Y's marker.
+    // Unset gid X to prevent the swap from propagating.
+    // Only run on near-square grids where row swaps actually occur.
+    // For clearly rectangular grids (aspect ratio > 1.3), findCirclesGrid is unambiguous.
+    const float board_width = board.is_asymetric_
+        ? static_cast<float>((2 * (board.cols_ - 1) + 1) * board.spacing_)
+        : static_cast<float>((board.cols_ - 1) * board.spacing_);
+    const float board_height = static_cast<float>((board.rows_ - 1) * board.spacing_);
+    const float aspect = std::max(board_width, board_height) / std::max(1.f, std::min(board_width, board_height));
+    const bool is_near_square = aspect < 1.3f;
+
+    if (tracker_state.has_previous_ && identification_method != "findCirclesGrid" && is_near_square)
+    {
+        const int total = board.rows_ * board.cols_;
+
+        // Build set of currently assigned gids
+        std::set<int> assigned_gids;
+        for (const auto& r : rings)
+            if (r.global_id_ >= 0) assigned_gids.insert(r.global_id_);
+
+        // Build map: gid → last known position (from tracks, not just prev frame)
+        // This catches swaps even when the neighbor disappeared several frames ago
+        std::unordered_map<int, cv::Point2f> prev_gid_pos;
+        for (const auto& [gid, track] : tracker_state.tracks_)
+        {
+            // Use tracks within last 5 frames
+            if (tracker_state.frame_counter_ - track.last_seen_frame <= 5)
+                prev_gid_pos[gid] = track.last_position;
+        }
+
+        // Account for board motion: compute average displacement between prev and curr frames
+        cv::Point2f avg_motion(0.f, 0.f);
+        int motion_count = 0;
+        for (const auto& ring : rings)
+        {
+            if (ring.global_id_ < 0) continue;
+            auto pit = prev_gid_pos.find(ring.global_id_);
+            if (pit != prev_gid_pos.end())
+            {
+                avg_motion += cv::Point2f(ring.col_, ring.row_) - pit->second;
+                ++motion_count;
+            }
+        }
+        if (motion_count > 0)
+            avg_motion /= static_cast<float>(motion_count);
+
+        const float swap_dist_threshold = 20.f;  // max distance after motion compensation
+        int disappeared_swaps = 0;
+
+        for (auto& ring : rings)
+        {
+            if (ring.global_id_ < 0) continue;
+            const int gid = ring.global_id_;
+            const int row = gid / board.cols_;
+            const int col = gid % board.cols_;
+            const cv::Point2f pos(ring.col_, ring.row_);
+
+            // Check adjacent rows: is there a neighbor gid that disappeared?
+            for (int dr = -1; dr <= 1; dr += 2)  // row ±1
+            {
+                const int nbr_row = row + dr;
+                if (nbr_row < 0 || nbr_row >= board.rows_) continue;
+                const int nbr_gid = board.row_and_col_to_id(nbr_row, col);
+
+                // Is the neighbor MISSING in current frame but WAS in previous frame?
+                if (assigned_gids.count(nbr_gid) == 0 && prev_gid_pos.count(nbr_gid) > 0)
+                {
+                    // Is the current marker at approximately the MOTION-COMPENSATED position
+                    // of the missing neighbor? Scale motion by frames elapsed since last seen.
+                    const auto& nbr_track = tracker_state.tracks_.at(nbr_gid);
+                    const int frames_since = tracker_state.frame_counter_ - nbr_track.last_seen_frame;
+                    const cv::Point2f scaled_motion = avg_motion * static_cast<float>(std::max(1, frames_since));
+                    const cv::Point2f expected_nbr_pos = prev_gid_pos[nbr_gid] + scaled_motion;
+                    const float dist_to_expected = static_cast<float>(cv::norm(pos - expected_nbr_pos));
+                    if (dist_to_expected < swap_dist_threshold)
+                    {
+                        spdlog::info("image {}: disappeared-neighbor swap: gid {} at prev gid {} pos "
+                                     "(dist={:.1f}px, motion=({:.1f},{:.1f})), unsetting",
+                                     image_idx, gid, nbr_gid, dist_to_expected, avg_motion.x, avg_motion.y);
+                        ring.global_id_ = -1;
+                        ++disappeared_swaps;
+                        break;
+                    }
+                }
+            }
+        }
+        if (disappeared_swaps > 0)
+        {
+            spdlog::info("image {}: fixed {} disappeared-neighbor swaps", image_idx, disappeared_swaps);
+        }
+    }
 
     std::vector<int> current_ids;
     current_ids.reserve(rings.size());

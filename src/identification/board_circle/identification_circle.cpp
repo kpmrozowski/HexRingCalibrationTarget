@@ -581,17 +581,213 @@ using circlegrid::TrackingState;
 using circlegrid::MarkerTrack;
 using circlegrid::HungarianTrackingResult;
 using circlegrid::ORBMotionField;
+using circlegrid::BlobVelocityField;
+
+/// Helper: solve rigid-body model (vCx, vCy, ω) from neighbor velocities
+static bool solve_rigid_body_2d(const std::vector<cv::Point2f>& positions,
+                                 const std::vector<cv::Point2f>& velocities,
+                                 const std::vector<size_t>& neighbor_indices,
+                                 int count,
+                                 const cv::Point2f& centroid,
+                                 float& vCx, float& vCy, float& omega)
+{
+    cv::Mat A(2 * count, 3, CV_32F);
+    cv::Mat b(2 * count, 1, CV_32F);
+
+    for (int i = 0; i < count; ++i)
+    {
+        const auto& p = positions[neighbor_indices[i]];
+        const auto& v = velocities[neighbor_indices[i]];
+        const float dx = p.x - centroid.x;
+        const float dy = p.y - centroid.y;
+
+        A.at<float>(2*i, 0)     = 1.f;
+        A.at<float>(2*i, 1)     = 0.f;
+        A.at<float>(2*i, 2)     = -dy;
+        b.at<float>(2*i, 0)     = v.x;
+
+        A.at<float>(2*i+1, 0)   = 0.f;
+        A.at<float>(2*i+1, 1)   = 1.f;
+        A.at<float>(2*i+1, 2)   = dx;
+        b.at<float>(2*i+1, 0)   = v.y;
+    }
+
+    cv::Mat params;
+    cv::solve(A, b, params, cv::DECOMP_SVD);
+    vCx = params.at<float>(0);
+    vCy = params.at<float>(1);
+    omega = params.at<float>(2);
+    return true;
+}
+
+cv::Point2f BlobVelocityField::transport_predict(const cv::Point2f& query,
+                                                  float dt, int k) const
+{
+    if (!valid || positions.empty()) return {0.f, 0.f};
+
+    // Find k nearest anchors to query
+    struct ND { float dist; size_t idx; };
+    std::vector<ND> neighbors;
+    neighbors.reserve(positions.size());
+    for (size_t i = 0; i < positions.size(); ++i)
+    {
+        const float d = static_cast<float>(cv::norm(query - positions[i]));
+        neighbors.push_back({d, i});
+    }
+
+    const int actual_k = std::min(k, static_cast<int>(neighbors.size()));
+    if (actual_k < 2) return {0.f, 0.f};
+
+    std::partial_sort(neighbors.begin(), neighbors.begin() + actual_k, neighbors.end(),
+                      [](const ND& a, const ND& b) { return a.dist < b.dist; });
+
+    std::vector<size_t> nbr_indices(actual_k);
+    cv::Point2f centroid(0.f, 0.f);
+    for (int i = 0; i < actual_k; ++i)
+    {
+        nbr_indices[i] = neighbors[i].idx;
+        centroid += positions[nbr_indices[i]];
+    }
+    centroid /= static_cast<float>(actual_k);
+
+    // Solve velocity rigid-body model: v_i = v_C + ω × r_i
+    float vCx, vCy, omega;
+    solve_rigid_body_2d(positions, velocities, nbr_indices, actual_k, centroid, vCx, vCy, omega);
+
+    // Transport velocity to query point: v_q = v_C + ω × (q - C)
+    const float rqx = query.x - centroid.x;
+    const float rqy = query.y - centroid.y;
+    const float vqx = vCx - omega * rqy;
+    const float vqy = vCy + omega * rqx;
+
+    // Solve acceleration rigid-body model if accelerations available:
+    // a_i = a_C + ε × r_i + ω × (ω × r_i)
+    // Rearranging: a_i - (-ω²*r_i) = a_C + ε × r_i
+    // So we solve: a_corr_i = a_C + ε × r_i where a_corr_i = a_i + ω²*r_i (remove centripetal)
+    float aqx = 0.f, aqy = 0.f;
+    if (!accelerations.empty() && accelerations.size() == positions.size())
+    {
+        // Check if any neighbor has nonzero acceleration
+        bool has_acc = false;
+        for (int i = 0; i < actual_k; ++i)
+        {
+            if (cv::norm(accelerations[nbr_indices[i]]) > 0.01f) { has_acc = true; break; }
+        }
+
+        if (has_acc)
+        {
+            // Remove centripetal from measured acceleration to get corrected acceleration
+            // a_corr_i = a_measured_i + ω² * r_i (centripetal is -ω²*r, so add ω²*r to remove it)
+            std::vector<cv::Point2f> acc_corrected(actual_k);
+            for (int i = 0; i < actual_k; ++i)
+            {
+                const auto& p = positions[nbr_indices[i]];
+                const float rx = p.x - centroid.x;
+                const float ry = p.y - centroid.y;
+                acc_corrected[i] = accelerations[nbr_indices[i]] + cv::Point2f(omega * omega * rx, omega * omega * ry);
+            }
+
+            // Solve: a_corr_i = a_C + ε × r_i → same structure as velocity
+            float aCx, aCy, epsilon;
+            // Build temporary vectors for the solver
+            std::vector<cv::Point2f> temp_pos(actual_k), temp_acc(actual_k);
+            std::vector<size_t> temp_idx(actual_k);
+            for (int i = 0; i < actual_k; ++i)
+            {
+                temp_pos[i] = positions[nbr_indices[i]];
+                temp_acc[i] = acc_corrected[i];
+                temp_idx[i] = static_cast<size_t>(i);
+            }
+            solve_rigid_body_2d(temp_pos, temp_acc, temp_idx, actual_k, centroid, aCx, aCy, epsilon);
+
+            // Transport acceleration to query: a_q = a_C + ε × r_q + ω×(ω×r_q)
+            // In 2D: ε × r = (-ε*ry, ε*rx), ω×(ω×r) = -ω²*r
+            aqx = aCx + (-epsilon * rqy) + (-omega * omega * rqx);
+            aqy = aCy + ( epsilon * rqx) + (-omega * omega * rqy);
+        }
+    }
+
+    // Predicted displacement: Δpos = v*dt + 0.5*a*dt²
+    return {vqx * dt + 0.5f * aqx * dt * dt,
+            vqy * dt + 0.5f * aqy * dt * dt};
+}
 
 void TrackingState::update(const std::vector<base::MarkerCoding>& markers, const std::vector<int>& global_ids,
                            const cv::Mat1b& image)
 {
     update_tracks(markers, global_ids);
+    update_blob_velocity_fields(markers);
     prev_markers_ = markers;
     prev_global_ids_ = global_ids;
-    // update_orb(image);  // ORB disabled — causing bt0 regression
     prev_image_ = image.clone();
     has_previous_ = true;
+
+    // Store current blob positions as prev for next frame
+    prev_blob_positions_.clear();
+    prev_blob_positions_.reserve(markers.size());
+    for (const auto& m : markers)
+        prev_blob_positions_.emplace_back(m.col_, m.row_);
+
+    // Store all detected positions for velocity interpolation (3-frame rolling buffer)
+    detected_positions_history_[history_write_idx_ % 3] = prev_blob_positions_;
+    ++history_write_idx_;
+
     ++frame_counter_;
+}
+
+void TrackingState::update_blob_velocity_fields(const std::vector<base::MarkerCoding>& curr_markers)
+{
+    forward_blob_field_ = {};
+    backward_blob_field_ = {};
+
+    if (!has_previous_ || prev_global_ids_.empty()) return;
+
+    // Use IDENTIFIED marker tracks for exact velocity computation.
+    // For each marker that was identified in BOTH the previous and current frame,
+    // compute the displacement vector. This is exact (no blob matching ambiguity).
+    //
+    // We compare prev_markers_/prev_global_ids_ (previous frame's identified markers)
+    // with the current curr_markers and the CURRENT tracks_ (which still hold previous positions).
+
+    for (const auto& [gid, track] : tracks_)
+    {
+        if (track.history_count < 2) continue;
+
+        const cv::Point2f prev_pos = track.position_history[track.history_count - 2];
+        const cv::Point2f curr_pos = track.position_history[track.history_count - 1];
+        const int curr_frame = track.frame_ids[track.history_count - 1];
+
+        // Only use recent tracks
+        if (frame_counter_ - curr_frame > 2) continue;
+
+        const cv::Point2f vel = curr_pos - prev_pos;  // velocity (px/frame, dt=1)
+
+        // Acceleration from central difference: a(t-1) = [s(t) - 2s(t-1) + s(t-2)] / dt²
+        // With dt=1 frame: a = s(t) - 2*s(t-1) + s(t-2)
+        cv::Point2f acc(0.f, 0.f);
+        if (track.history_count >= 3)
+        {
+            const cv::Point2f pp_pos = track.position_history[track.history_count - 3];
+            // Central difference at t-1: a = curr - 2*prev + pp
+            acc = curr_pos - 2.f * prev_pos + pp_pos;
+        }
+
+        // Forward field: anchored at previous position
+        forward_blob_field_.positions.push_back(prev_pos);
+        forward_blob_field_.velocities.push_back(vel);
+        forward_blob_field_.accelerations.push_back(acc);
+
+        // Backward field: anchored at current position
+        backward_blob_field_.positions.push_back(curr_pos);
+        backward_blob_field_.velocities.push_back(vel);
+        backward_blob_field_.accelerations.push_back(acc);
+    }
+
+    forward_blob_field_.valid = forward_blob_field_.positions.size() >= 5;
+    backward_blob_field_.valid = backward_blob_field_.positions.size() >= 5;
+
+    if (forward_blob_field_.valid)
+        spdlog::debug("Blob velocity field: {} tracked markers", forward_blob_field_.positions.size());
 }
 
 void TrackingState::clear()
@@ -995,6 +1191,54 @@ HungarianTrackingResult circlegrid::identify_with_hungarian_tracking(const Track
             result.matched_count = count;
             result.avg_cost = count > 0 ? total_cost / static_cast<float>(count) : 0.f;
             result.max_cost = max_cost_val;
+
+            // Bidirectional blob-velocity acceptance check.
+            // For each assigned marker, use rigid-body velocity transport from
+            // neighboring blobs to predict position in BOTH directions:
+            //   Forward:  prev_pos + v_forward(prev_pos) → should ≈ curr_pos
+            //   Backward: curr_pos - v_backward(curr_pos) → should ≈ prev_pos
+            // If either check fails (distance > 1% of shorter image edge), reject.
+            const float img_short_edge = static_cast<float>(
+                std::min(state.prev_image_.cols, state.prev_image_.rows));
+            const float tolerance = 0.08f * img_short_edge;  // 8% of shorter edge (~48px for 600px)
+
+            if (state.forward_blob_field_.valid && state.backward_blob_field_.valid && tolerance > 0.f)
+            {
+                for (size_t k = 0; k < matches.size(); ++k)
+                {
+                    if (!inlier_mask[k]) continue;
+                    const int gid = matches[k].first;
+                    const int curr_idx = matches[k].second;
+                    if (result.global_ids[curr_idx] != gid) continue;
+
+                    auto track_it = state.tracks_.find(gid);
+                    if (track_it == state.tracks_.end() || track_it->second.history_count < 1)
+                        continue;
+
+                    const cv::Point2f prev_pos = track_it->second.last_position;
+                    const cv::Point2f curr_pos(curr_markers[curr_idx].col_, curr_markers[curr_idx].row_);
+
+                    // Forward check: predict current from previous
+                    const cv::Point2f v_fwd = state.forward_blob_field_.transport_predict(prev_pos);
+                    const cv::Point2f predicted_curr = prev_pos + v_fwd;
+                    const float fwd_err = static_cast<float>(cv::norm(predicted_curr - curr_pos));
+
+                    // Backward check: predict previous from current
+                    const cv::Point2f v_bwd = state.backward_blob_field_.transport_predict(curr_pos);
+                    const cv::Point2f predicted_prev = curr_pos - v_bwd;
+                    const float bwd_err = static_cast<float>(cv::norm(predicted_prev - prev_pos));
+
+                    if (fwd_err > tolerance || bwd_err > tolerance)
+                    {
+                        spdlog::info("Blob-velocity reject: gid {} fwd_err={:.1f} bwd_err={:.1f} "
+                                     "(tol={:.1f}) prev=({:.0f},{:.0f}) curr=({:.0f},{:.0f})",
+                                     gid, fwd_err, bwd_err, tolerance,
+                                     prev_pos.x, prev_pos.y, curr_pos.x, curr_pos.y);
+                        result.global_ids[curr_idx] = -1;
+                        --result.matched_count;
+                    }
+                }
+            }
         }
     }
     else if (!matches.empty())

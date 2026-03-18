@@ -56,6 +56,22 @@ struct ORBMotionField
     bool valid = false;
 };
 
+/// Blob-level velocity+acceleration field — anchored at blob positions, ID-independent.
+/// Uses identified marker tracks for exact velocity/acceleration computation.
+struct BlobVelocityField
+{
+    std::vector<cv::Point2f> positions;        // anchor positions
+    std::vector<cv::Point2f> velocities;       // displacement vectors per frame (px/frame)
+    std::vector<cv::Point2f> accelerations;    // central-diff acceleration (px/frame²), zero if unavailable
+    bool valid = false;
+
+    /// Transport velocity+acceleration to a query point using 2D rigid-body kinematics.
+    /// Solves for (vCx, vCy, ω) and (aCx, aCy, ε) from k nearest neighbors.
+    /// Returns predicted POSITION offset: Δpos = v*dt + 0.5*a*dt²
+    cv::Point2f transport_predict(const cv::Point2f& query,
+                                   float dt = 1.f, int k = 5) const;
+};
+
 struct TrackingState
 {
     std::vector<base::MarkerCoding> prev_markers_;
@@ -73,12 +89,31 @@ struct TrackingState
     // For 180° ambiguity resolution across findCirclesGrid calls
     std::vector<cv::Point2f> prev_findcircles_centers_;
 
+    // 3-frame history of ALL detected marker positions (for velocity interpolation)
+    std::array<std::vector<cv::Point2f>, 3> detected_positions_history_;
+    int history_write_idx_ = 0;
+
+    // Last findCirclesGrid frame's marker positions (trusted reference for swap detection)
+    // Indexed by global_id: last_fcg_positions_[gid] = image position
+    std::vector<cv::Point2f> last_fcg_positions_;
+    int last_fcg_frame_ = -1;
+
     // ORB motion field data
     std::vector<cv::KeyPoint> prev_orb_keypoints_;
     cv::Mat prev_orb_descriptors_;
 
+    // Blob velocity fields for bidirectional acceptance check
+    BlobVelocityField forward_blob_field_;       // anchored at prev positions, vel+acc forward
+    BlobVelocityField backward_blob_field_;      // anchored at curr positions, vel+acc backward
+    std::vector<cv::Point2f> prev_blob_positions_;  // raw positions from previous frame
+
+    // Debug: per-marker prediction vectors (from→to) for visualization
+    // Populated during Hungarian tracking, drawn by showExtractionVisualization
+    std::vector<std::pair<cv::Point2f, cv::Point2f>> debug_prediction_vectors_;  // (current_pos, predicted_pos)
+
     void update(const std::vector<base::MarkerCoding>& markers, const std::vector<int>& global_ids,
                 const cv::Mat1b& image);
+    void update_blob_velocity_fields(const std::vector<base::MarkerCoding>& curr_markers);
     void clear();
 
     /// Predict position for a tracked marker using up to 3 frames of history
