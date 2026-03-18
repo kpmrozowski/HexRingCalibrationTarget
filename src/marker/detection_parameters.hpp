@@ -23,7 +23,7 @@ struct DetectionParameters
 
     float interia_ratio_ = 0.4f;
 
-    float min_difference_scale_ = 1.1f;  // at least 20% brighterr
+    float min_difference_scale_ = 1.5f;  // at least 20% brighterr
 
     float edge_average_difference_allowed = 0.5f;
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <set>
@@ -577,14 +578,20 @@ namespace identification
 {
 
 using circlegrid::TrackingState;
+using circlegrid::MarkerTrack;
+using circlegrid::HungarianTrackingResult;
+using circlegrid::ORBMotionField;
 
 void TrackingState::update(const std::vector<base::MarkerCoding>& markers, const std::vector<int>& global_ids,
                            const cv::Mat1b& image)
 {
+    update_tracks(markers, global_ids);
     prev_markers_ = markers;
     prev_global_ids_ = global_ids;
+    // update_orb(image);  // ORB disabled — causing bt0 regression
     prev_image_ = image.clone();
     has_previous_ = true;
+    ++frame_counter_;
 }
 
 void TrackingState::clear()
@@ -593,6 +600,722 @@ void TrackingState::clear()
     prev_global_ids_.clear();
     prev_image_.release();
     has_previous_ = false;
+    tracks_.clear();
+    orientation_locked_ = false;
+    frame_counter_ = 0;
+    prev_findcircles_centers_.clear();
+    prev_orb_keypoints_.clear();
+    prev_orb_descriptors_.release();
+}
+
+void TrackingState::update_orb(const cv::Mat1b& image)
+{
+    if (image.empty()) return;
+    auto orb = cv::ORB::create(500);
+    orb->detectAndCompute(image, cv::noArray(), prev_orb_keypoints_, prev_orb_descriptors_);
+}
+
+ORBMotionField TrackingState::estimate_motion_field(const cv::Mat1b& current_image) const
+{
+    ORBMotionField field;
+    if (prev_orb_descriptors_.empty() || current_image.empty()) return field;
+
+    auto orb = cv::ORB::create(500);
+    std::vector<cv::KeyPoint> curr_keypoints;
+    cv::Mat curr_descriptors;
+    orb->detectAndCompute(current_image, cv::noArray(), curr_keypoints, curr_descriptors);
+
+    if (curr_descriptors.empty()) return field;
+
+    cv::BFMatcher matcher(cv::NORM_HAMMING);
+    std::vector<std::vector<cv::DMatch>> knn_matches;
+    matcher.knnMatch(prev_orb_descriptors_, curr_descriptors, knn_matches, 2);
+
+    // Lowe's ratio test
+    for (const auto& m : knn_matches)
+    {
+        if (m.size() >= 2 && m[0].distance < 0.75f * m[1].distance)
+        {
+            const auto& prev_pt = prev_orb_keypoints_[m[0].queryIdx].pt;
+            const auto& curr_pt = curr_keypoints[m[0].trainIdx].pt;
+            field.locations.push_back(curr_pt);
+            field.displacements.push_back(curr_pt - prev_pt);
+        }
+    }
+
+    field.valid = field.locations.size() >= 8;
+    if (field.valid)
+    {
+        spdlog::debug("ORB motion field: {} matched features", field.locations.size());
+    }
+    return field;
+}
+
+cv::Point2f TrackingState::predict_position_with_orb(
+    const int global_id, const int current_frame, const ORBMotionField& motion_field) const
+{
+    cv::Point2f base = predict_position(global_id, current_frame);
+
+    auto it = tracks_.find(global_id);
+    if (it == tracks_.end()) return base;
+    const auto& track = it->second;
+
+    // If track is recent (<= 2 frames old), standard prediction is fine
+    if (current_frame - track.last_seen_frame <= 2 && track.history_count >= 2)
+        return base;
+
+    if (!motion_field.valid || motion_field.locations.empty())
+        return base;
+
+    // Find 4 nearest ORB features within 10% of shorter image edge
+    const float max_radius = std::min(
+        static_cast<float>(prev_image_.cols),
+        static_cast<float>(prev_image_.rows)) * 0.1f;
+
+    struct Neighbor { float dist; cv::Point2f displacement; };
+    std::vector<Neighbor> neighbors;
+    const cv::Point2f query = track.last_position;
+
+    for (size_t i = 0; i < motion_field.locations.size(); ++i)
+    {
+        const float d = static_cast<float>(cv::norm(motion_field.locations[i] - query));
+        if (d < max_radius)
+            neighbors.push_back({d, motion_field.displacements[i]});
+    }
+
+    if (neighbors.size() < 2) return base;
+
+    std::sort(neighbors.begin(), neighbors.end(),
+              [](const auto& a, const auto& b) { return a.dist < b.dist; });
+    const int k = std::min(4, static_cast<int>(neighbors.size()));
+
+    // Inverse-distance weighted interpolation
+    cv::Point2f weighted_disp(0.f, 0.f);
+    float w_sum = 0.f;
+    for (int i = 0; i < k; ++i)
+    {
+        const float w = 1.f / (neighbors[i].dist + 1e-6f);
+        weighted_disp += neighbors[i].displacement * w;
+        w_sum += w;
+    }
+    weighted_disp /= w_sum;
+
+    const int gap = current_frame - track.last_seen_frame;
+    return track.last_position + weighted_disp * static_cast<float>(gap);
+}
+
+void TrackingState::update_tracks(const std::vector<base::MarkerCoding>& markers, const std::vector<int>& global_ids)
+{
+    for (size_t i = 0; i < markers.size(); ++i)
+    {
+        if (i >= global_ids.size() || global_ids[i] < 0)
+        {
+            continue;
+        }
+        const int gid = global_ids[i];
+        const cv::Point2f curr_pos(markers[i].col_, markers[i].row_);
+
+        auto it = tracks_.find(gid);
+        if (it != tracks_.end())
+        {
+            auto& track = it->second;
+            // Shift history buffer
+            if (track.history_count < 3)
+            {
+                track.position_history[track.history_count] = curr_pos;
+                track.frame_ids[track.history_count] = frame_counter_;
+                ++track.history_count;
+            }
+            else
+            {
+                track.position_history[0] = track.position_history[1];
+                track.position_history[1] = track.position_history[2];
+                track.position_history[2] = curr_pos;
+                track.frame_ids[0] = track.frame_ids[1];
+                track.frame_ids[1] = track.frame_ids[2];
+                track.frame_ids[2] = frame_counter_;
+            }
+            track.last_position = curr_pos;
+            track.last_seen_frame = frame_counter_;
+            ++track.age;
+        }
+        else
+        {
+            MarkerTrack track;
+            track.position_history[0] = curr_pos;
+            track.frame_ids[0] = frame_counter_;
+            track.history_count = 1;
+            track.last_position = curr_pos;
+            track.global_id = gid;
+            track.last_seen_frame = frame_counter_;
+            track.age = 1;
+            tracks_[gid] = track;
+        }
+    }
+
+    // Prune tracks not seen for >10 frames
+    std::erase_if(tracks_, [this](const auto& pair) { return frame_counter_ - pair.second.last_seen_frame > 10; });
+}
+
+cv::Point2f TrackingState::predict_position(const int global_id, const int current_frame) const
+{
+    auto it = tracks_.find(global_id);
+    if (it == tracks_.end())
+    {
+        return {0.f, 0.f};
+    }
+    const auto& track = it->second;
+
+    if (track.history_count >= 3)
+    {
+        // Least-squares velocity from 3 points: v = sum((p_i - p_mean) * (t_i - t_mean)) / sum((t_i - t_mean)^2)
+        const float t0 = static_cast<float>(track.frame_ids[0]);
+        const float t1 = static_cast<float>(track.frame_ids[1]);
+        const float t2 = static_cast<float>(track.frame_ids[2]);
+        const float t_mean = (t0 + t1 + t2) / 3.f;
+
+        const cv::Point2f p_mean = (track.position_history[0] + track.position_history[1] + track.position_history[2]) / 3.f;
+
+        float sum_tt = 0.f;
+        cv::Point2f sum_tp(0.f, 0.f);
+        for (int k = 0; k < 3; ++k)
+        {
+            const float dt = static_cast<float>(track.frame_ids[k]) - t_mean;
+            sum_tt += dt * dt;
+            sum_tp += (track.position_history[k] - p_mean) * dt;
+        }
+
+        if (sum_tt > 1e-6f)
+        {
+            const cv::Point2f velocity = sum_tp / sum_tt;
+            const float dt = static_cast<float>(current_frame) - t2;
+            return track.position_history[2] + velocity * dt;
+        }
+    }
+    else if (track.history_count == 2)
+    {
+        const float dt_hist = static_cast<float>(track.frame_ids[1] - track.frame_ids[0]);
+        if (dt_hist > 0.f)
+        {
+            const cv::Point2f velocity = (track.position_history[1] - track.position_history[0]) / dt_hist;
+            const float dt = static_cast<float>(current_frame - track.frame_ids[1]);
+            return track.position_history[1] + velocity * dt;
+        }
+    }
+
+    return track.last_position;
+}
+
+// --- Hungarian Algorithm (Jonker-Volgenant) ---
+
+std::vector<int> circlegrid::hungarian_assignment(const std::vector<std::vector<float>>& cost_matrix, float max_cost)
+{
+    if (cost_matrix.empty())
+    {
+        return {};
+    }
+
+    const int n_rows = static_cast<int>(cost_matrix.size());
+    const int n_cols = static_cast<int>(cost_matrix[0].size());
+    const int n = std::max(n_rows, n_cols);
+
+    // Pad to square
+    std::vector<std::vector<float>> c(n, std::vector<float>(n, max_cost));
+    for (int i = 0; i < n_rows; ++i)
+    {
+        for (int j = 0; j < n_cols; ++j)
+        {
+            c[i][j] = cost_matrix[i][j];
+        }
+    }
+
+    // JV algorithm with successive shortest paths
+    constexpr float kInf = 1e18f;
+    std::vector<float> u(n + 1, 0.f), v(n + 1, 0.f);
+    std::vector<int> p(n + 1, 0), way(n + 1, 0);
+
+    for (int i = 1; i <= n; ++i)
+    {
+        p[0] = i;
+        int j0 = 0;
+        std::vector<float> minv(n + 1, kInf);
+        std::vector<bool> used(n + 1, false);
+
+        do
+        {
+            used[j0] = true;
+            int i0 = p[j0];
+            float delta = kInf;
+            int j1 = -1;
+
+            for (int j = 1; j <= n; ++j)
+            {
+                if (!used[j])
+                {
+                    const float cur = c[i0 - 1][j - 1] - u[i0] - v[j];
+                    if (cur < minv[j])
+                    {
+                        minv[j] = cur;
+                        way[j] = j0;
+                    }
+                    if (minv[j] < delta)
+                    {
+                        delta = minv[j];
+                        j1 = j;
+                    }
+                }
+            }
+
+            for (int j = 0; j <= n; ++j)
+            {
+                if (used[j])
+                {
+                    u[p[j]] += delta;
+                    v[j] -= delta;
+                }
+                else
+                {
+                    minv[j] -= delta;
+                }
+            }
+
+            j0 = j1;
+        } while (p[j0] != 0);
+
+        do
+        {
+            const int j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+        } while (j0);
+    }
+
+    // Extract assignment: row i -> col result[i]
+    std::vector<int> result(n_rows, -1);
+    for (int j = 1; j <= n; ++j)
+    {
+        if (p[j] > 0 && p[j] <= n_rows)
+        {
+            const int row = p[j] - 1;
+            const int col = j - 1;
+            if (col < n_cols && cost_matrix[row][col] <= max_cost)
+            {
+                result[row] = col;
+            }
+        }
+    }
+    return result;
+}
+
+// --- Velocity-Predicted Hungarian Tracking ---
+
+HungarianTrackingResult circlegrid::identify_with_hungarian_tracking(const TrackingState& state,
+                                                                     const std::vector<base::MarkerCoding>& curr_markers,
+                                                                     const BoardCircleGrid& board,
+                                                                     float max_distance, float ransac_threshold,
+                                                                     const ORBMotionField* motion_field)
+{
+    HungarianTrackingResult result;
+    result.global_ids.assign(curr_markers.size(), -1);
+
+    // Collect all tracked global_ids
+    std::vector<int> prev_ids;
+    std::vector<cv::Point2f> predicted_positions;
+    for (const auto& [gid, track] : state.tracks_)
+    {
+        if (track.age > 0)
+        {
+            prev_ids.push_back(gid);
+            if (motion_field && motion_field->valid)
+                predicted_positions.push_back(state.predict_position_with_orb(gid, state.frame_counter_, *motion_field));
+            else
+                predicted_positions.push_back(state.predict_position(gid, state.frame_counter_));
+        }
+    }
+
+    if (prev_ids.empty() || curr_markers.empty())
+    {
+        return result;
+    }
+
+    const int n_prev = static_cast<int>(prev_ids.size());
+    const int n_curr = static_cast<int>(curr_markers.size());
+
+    // Build cost matrix
+    std::vector<std::vector<float>> cost(n_prev, std::vector<float>(n_curr));
+    for (int i = 0; i < n_prev; ++i)
+    {
+        for (int j = 0; j < n_curr; ++j)
+        {
+            const cv::Point2f curr_pos(curr_markers[j].col_, curr_markers[j].row_);
+            cost[i][j] = static_cast<float>(cv::norm(predicted_positions[i] - curr_pos));
+        }
+    }
+
+    // Solve
+    const auto assignment = hungarian_assignment(cost, max_distance);
+
+    // Extract matches for RANSAC validation
+    std::vector<cv::Point2f> src_pts, dst_pts;
+    std::vector<std::pair<int, int>> matches;  // (prev_global_id, curr_idx)
+    for (int i = 0; i < n_prev; ++i)
+    {
+        if (assignment[i] >= 0)
+        {
+            const auto& track = state.tracks_.at(prev_ids[i]);
+            src_pts.push_back(track.last_position);
+            dst_pts.emplace_back(curr_markers[assignment[i]].col_, curr_markers[assignment[i]].row_);
+            matches.emplace_back(prev_ids[i], assignment[i]);
+        }
+    }
+
+    // RANSAC validation
+    if (matches.size() >= 4)
+    {
+        std::vector<uchar> inlier_mask;
+        const cv::Mat H = cv::findHomography(src_pts, dst_pts, cv::RANSAC, ransac_threshold, inlier_mask);
+        if (!H.empty())
+        {
+            float total_cost = 0.f;
+            float max_cost_val = 0.f;
+            int count = 0;
+            for (size_t k = 0; k < matches.size(); ++k)
+            {
+                if (inlier_mask[k])
+                {
+                    const int curr_idx = matches[k].second;
+                    result.global_ids[curr_idx] = matches[k].first;
+                    const float c = cost[static_cast<int>(
+                        std::find(prev_ids.begin(), prev_ids.end(), matches[k].first) - prev_ids.begin())][curr_idx];
+                    total_cost += c;
+                    max_cost_val = std::max(max_cost_val, c);
+                    ++count;
+                }
+            }
+            result.matched_count = count;
+            result.avg_cost = count > 0 ? total_cost / static_cast<float>(count) : 0.f;
+            result.max_cost = max_cost_val;
+        }
+    }
+    else if (!matches.empty())
+    {
+        // Too few for RANSAC, accept all
+        float total_cost = 0.f;
+        for (const auto& [gid, curr_idx] : matches)
+        {
+            result.global_ids[curr_idx] = gid;
+            const float c = cost[static_cast<int>(std::find(prev_ids.begin(), prev_ids.end(), gid) - prev_ids.begin())]
+                                [curr_idx];
+            total_cost += c;
+            result.max_cost = std::max(result.max_cost, c);
+        }
+        result.matched_count = static_cast<int>(matches.size());
+        result.avg_cost = total_cost / static_cast<float>(matches.size());
+    }
+
+    spdlog::debug("Hungarian tracking: {} matched of {} prev, {} curr, avg_cost={:.1f}, max_cost={:.1f}",
+                  result.matched_count, n_prev, n_curr, result.avg_cost, result.max_cost);
+    return result;
+}
+
+// --- 180-Degree Ambiguity ---
+
+bool circlegrid::board_has_180_ambiguity(const BoardCircleGrid& board)
+{
+    if (board.is_asymetric_)
+    {
+        return board.rows_ % 2 == 0;
+    }
+    return (board.rows_ % 2 == 0) && (board.cols_ % 2 == 0);
+}
+
+std::vector<int> circlegrid::flip_ids_180(const std::vector<int>& global_ids, const BoardCircleGrid& board)
+{
+    std::vector<int> flipped(global_ids.size(), -1);
+    for (size_t i = 0; i < global_ids.size(); ++i)
+    {
+        if (global_ids[i] < 0)
+        {
+            continue;
+        }
+        const auto rc = board.id_to_row_and_col(global_ids[i]);
+        const int flipped_row = board.rows_ - 1 - rc(0);
+        const int flipped_col = board.cols_ - 1 - rc(1);
+        flipped[i] = board.row_and_col_to_id(flipped_row, flipped_col);
+    }
+    return flipped;
+}
+
+std::vector<int> circlegrid::resolve_180_ambiguity(const std::vector<int>& global_ids,
+                                                    const std::vector<base::MarkerCoding>& curr_markers,
+                                                    const TrackingState& state, const BoardCircleGrid& board)
+{
+    if (!board_has_180_ambiguity(board) || state.orientation_locked_)
+    {
+        return global_ids;
+    }
+
+    if (state.tracks_.empty())
+    {
+        return global_ids;
+    }
+
+    // Compute velocity variance for original and flipped
+    auto compute_velocity_variance = [&](const std::vector<int>& ids) -> float
+    {
+        std::vector<cv::Point2f> velocities;
+        for (size_t i = 0; i < ids.size(); ++i)
+        {
+            if (ids[i] < 0)
+            {
+                continue;
+            }
+            auto it = state.tracks_.find(ids[i]);
+            if (it == state.tracks_.end() || it->second.age < 1)
+            {
+                continue;
+            }
+            const cv::Point2f curr_pos(curr_markers[i].col_, curr_markers[i].row_);
+            velocities.push_back(curr_pos - it->second.last_position);
+        }
+
+        if (velocities.size() < 3)
+        {
+            return std::numeric_limits<float>::max();
+        }
+
+        cv::Point2f mean_vel(0.f, 0.f);
+        for (const auto& v : velocities)
+        {
+            mean_vel += v;
+        }
+        mean_vel /= static_cast<float>(velocities.size());
+
+        float variance = 0.f;
+        for (const auto& v : velocities)
+        {
+            const cv::Point2f diff = v - mean_vel;
+            variance += diff.x * diff.x + diff.y * diff.y;
+        }
+        return variance / static_cast<float>(velocities.size());
+    };
+
+    const auto flipped_ids = flip_ids_180(global_ids, board);
+    const float orig_var = compute_velocity_variance(global_ids);
+    const float flip_var = compute_velocity_variance(flipped_ids);
+
+    spdlog::debug("180-ambiguity: orig_var={:.1f}, flip_var={:.1f}", orig_var, flip_var);
+
+    if (flip_var < orig_var * 0.5f)
+    {
+        spdlog::info("180-ambiguity: FLIPPED (flip_var={:.1f} < orig_var={:.1f} * 0.5)", flip_var, orig_var);
+        return flipped_ids;
+    }
+    return global_ids;
+}
+
+// --- Local Homography Re-identification ---
+
+void circlegrid::identify_unmatched_by_local_homography(std::vector<base::MarkerRing>& markers,
+                                                         const BoardCircleGrid& board)
+{
+    // Collect identified markers with their board coordinates
+    std::vector<cv::Point2f> board_pts;
+    std::vector<cv::Point2f> image_pts;
+    std::vector<int> identified_indices;
+    std::set<int> used_global_ids;
+
+    for (size_t i = 0; i < markers.size(); ++i)
+    {
+        if (markers[i].global_id_ >= 0)
+        {
+            const auto rc = board.id_to_row_and_col(markers[i].global_id_);
+            const int row = rc(0);
+            const int col = rc(1);
+
+            float bx, by;
+            if (board.is_asymetric_)
+            {
+                bx = static_cast<float>((2 * col + row % 2) * board.spacing_);
+                by = static_cast<float>(row * board.spacing_);
+            }
+            else
+            {
+                bx = static_cast<float>(col * board.spacing_);
+                by = static_cast<float>(row * board.spacing_);
+            }
+
+            board_pts.emplace_back(bx, by);
+            image_pts.emplace_back(markers[i].col_, markers[i].row_);
+            identified_indices.push_back(static_cast<int>(i));
+            used_global_ids.insert(markers[i].global_id_);
+        }
+    }
+
+    if (board_pts.size() < 4)
+    {
+        spdlog::debug("Local homography: only {} identified markers, need 4+", board_pts.size());
+        return;
+    }
+
+    // Compute global homography: board -> image
+    const cv::Mat H_global = cv::findHomography(board_pts, image_pts, cv::RANSAC, 5.0);
+    if (H_global.empty())
+    {
+        spdlog::debug("Local homography: global homography failed");
+        return;
+    }
+
+    // Pre-compute all expected board positions
+    struct BoardPosition
+    {
+        cv::Point2f board_pt;
+        int global_id;
+    };
+    std::vector<BoardPosition> all_board_positions;
+    for (int r = 0; r < board.rows_; ++r)
+    {
+        for (int c = 0; c < board.cols_; ++c)
+        {
+            const int gid = board.row_and_col_to_id(r, c);
+            float bx, by;
+            if (board.is_asymetric_)
+            {
+                bx = static_cast<float>((2 * c + r % 2) * board.spacing_);
+                by = static_cast<float>(r * board.spacing_);
+            }
+            else
+            {
+                bx = static_cast<float>(c * board.spacing_);
+                by = static_cast<float>(r * board.spacing_);
+            }
+            all_board_positions.push_back({cv::Point2f(bx, by), gid});
+        }
+    }
+
+    // Compute mean marker spacing in image (for relative threshold)
+    float mean_spacing = 0.f;
+    int spacing_count = 0;
+    for (size_t i = 1; i < image_pts.size(); ++i)
+    {
+        for (size_t j = 0; j < i; ++j)
+        {
+            const float dist = static_cast<float>(cv::norm(image_pts[i] - image_pts[j]));
+            // Only count nearby pairs (within 2x expected spacing)
+            if (dist < 200.f)
+            {
+                mean_spacing += dist;
+                ++spacing_count;
+            }
+        }
+    }
+    if (spacing_count > 0)
+    {
+        mean_spacing /= static_cast<float>(spacing_count);
+    }
+    else
+    {
+        mean_spacing = 50.f;  // fallback
+    }
+
+    int newly_identified = 0;
+
+    for (size_t i = 0; i < markers.size(); ++i)
+    {
+        if (markers[i].global_id_ >= 0)
+        {
+            continue;
+        }
+
+        const cv::Point2f img_pos(markers[i].col_, markers[i].row_);
+
+        // Try global homography first
+        float best_dist = mean_spacing * 0.3f;  // 30% of spacing threshold
+        int best_gid = -1;
+
+        // Project all board positions through global H
+        for (const auto& bp : all_board_positions)
+        {
+            if (used_global_ids.count(bp.global_id))
+            {
+                continue;
+            }
+            const cv::Mat pt = (cv::Mat_<double>(3, 1) << bp.board_pt.x, bp.board_pt.y, 1.0);
+            const cv::Mat projected = H_global * pt;
+            const cv::Point2f proj_img(static_cast<float>(projected.at<double>(0) / projected.at<double>(2)),
+                                        static_cast<float>(projected.at<double>(1) / projected.at<double>(2)));
+            const float dist = static_cast<float>(cv::norm(img_pos - proj_img));
+            if (dist < best_dist)
+            {
+                best_dist = dist;
+                best_gid = bp.global_id;
+            }
+        }
+
+        // Try local homography (4 closest identified neighbors)
+        if (best_gid < 0 && identified_indices.size() >= 4)
+        {
+            std::vector<std::pair<float, int>> neighbor_dists;
+            for (size_t k = 0; k < identified_indices.size(); ++k)
+            {
+                const float d = static_cast<float>(cv::norm(img_pos - image_pts[k]));
+                neighbor_dists.emplace_back(d, static_cast<int>(k));
+            }
+            std::partial_sort(neighbor_dists.begin(),
+                              neighbor_dists.begin() + std::min(4, static_cast<int>(neighbor_dists.size())),
+                              neighbor_dists.end());
+
+            std::vector<cv::Point2f> local_board, local_image;
+            for (int k = 0; k < std::min(4, static_cast<int>(neighbor_dists.size())); ++k)
+            {
+                const int idx = neighbor_dists[k].second;
+                local_board.push_back(board_pts[idx]);
+                local_image.push_back(image_pts[idx]);
+            }
+
+            const cv::Mat H_local = cv::findHomography(local_board, local_image, 0);
+            if (!H_local.empty())
+            {
+                for (const auto& bp : all_board_positions)
+                {
+                    if (used_global_ids.count(bp.global_id))
+                    {
+                        continue;
+                    }
+                    const cv::Mat pt = (cv::Mat_<double>(3, 1) << bp.board_pt.x, bp.board_pt.y, 1.0);
+                    const cv::Mat projected = H_local * pt;
+                    const cv::Point2f proj_img(
+                        static_cast<float>(projected.at<double>(0) / projected.at<double>(2)),
+                        static_cast<float>(projected.at<double>(1) / projected.at<double>(2)));
+                    const float dist = static_cast<float>(cv::norm(img_pos - proj_img));
+                    if (dist < best_dist)
+                    {
+                        best_dist = dist;
+                        best_gid = bp.global_id;
+                    }
+                }
+            }
+        }
+
+        if (best_gid >= 0)
+        {
+            markers[i].global_id_ = best_gid;
+            used_global_ids.insert(best_gid);
+            ++newly_identified;
+            spdlog::debug("Local homography: marker at ({:.1f}, {:.1f}) -> global_id={} (dist={:.1f})", markers[i].col_,
+                          markers[i].row_, best_gid, best_dist);
+        }
+    }
+
+    spdlog::debug("Local homography: identified {} new markers", newly_identified);
+}
+
+void circlegrid::validate_and_correct_topology(std::vector<base::MarkerRing>& markers, const BoardCircleGrid& board)
+{
+    // No-op: row swap detection is now done in detection.cpp using tracker state comparison,
+    // which is more reliable than spatial-ordering approaches.
+    (void)markers;
+    (void)board;
 }
 
 std::optional<std::vector<int>> circlegrid::identify_with_tracking(const std::vector<base::MarkerCoding>& prev_markers,
@@ -992,70 +1715,259 @@ void circlegrid::identify_new_markers_by_row_lines(std::vector<base::MarkerRing>
     }
 }
 
+bool populate_indices(std::vector<int>& indices, const std::vector<base::MarkerCoding>& coding_markers,
+                      const std::vector<cv::Point2f>& centers)
+{
+    indices.clear();
+    for (size_t idx_marker = 0; idx_marker < coding_markers.size(); ++idx_marker)
+    {
+        bool found = false;
+        const base::MarkerCoding& marker = coding_markers[idx_marker];
+        for (size_t idx_center = 0; idx_center < centers.size(); ++idx_center)
+        {
+            const cv::Point2f& center = centers[idx_center];
+            if (found = marker.row_ == center.y && marker.col_ == center.x; found)
+            {
+                indices.push_back(int(idx_center));
+                break;
+            }
+        }
+
+        if (!found)
+        {
+            indices.push_back(-1);
+            spdlog::warn("Center id {} ({:0.1f}, {:0.1f}) was not identified!", idx_marker, marker.col_, marker.row_);
+        }
+    }
+
+    if (coding_markers.size() != indices.size())
+    {
+        throw std::runtime_error(std::format("Identified {} markers of {}!", indices.size(), coding_markers.size()));
+    }
+    return true;
+}
+
+/// Apply orientation transform to findCirclesGrid centers.
+/// For a fixed pattern_size, the only valid orientations are:
+///   0 = IDENTITY: raw findCirclesGrid order
+///   1 = FLIP_180: reverse the entire array (180° rotation of the grid)
+static std::vector<cv::Point2f> apply_orientation(const std::vector<cv::Point2f>& centers,
+                                                   int /*rows*/, int /*cols*/, int orientation)
+{
+    if (orientation == 1)
+    {
+        auto result = centers;
+        std::reverse(result.begin(), result.end());
+        return result;
+    }
+    return centers;  // IDENTITY
+}
+
+/// Compute board 2D coordinates for all grid positions
+static std::vector<cv::Point2f> compute_board_points(const BoardCircleGrid& board)
+{
+    std::vector<cv::Point2f> pts;
+    pts.reserve(board.rows_ * board.cols_);
+    for (int r = 0; r < board.rows_; ++r)
+    {
+        for (int c = 0; c < board.cols_; ++c)
+        {
+            float bx, by;
+            if (board.is_asymetric_)
+            {
+                bx = static_cast<float>((2 * c + r % 2)) * board.spacing_;
+                by = static_cast<float>(r) * board.spacing_;
+            }
+            else
+            {
+                bx = static_cast<float>(c) * board.spacing_;
+                by = static_cast<float>(r) * board.spacing_;
+            }
+            pts.emplace_back(bx, by);
+        }
+    }
+    return pts;
+}
+
+/// Compute homography reprojection error for a given orientation.
+/// Returns average squared reprojection error per point.
+static float compute_orientation_cost(const std::vector<cv::Point2f>& centers,
+                                       const std::vector<cv::Point2f>& board_pts,
+                                       int rows, int cols, int orientation)
+{
+    const auto remapped = apply_orientation(centers, rows, cols, orientation);
+    const cv::Mat H = cv::findHomography(board_pts, remapped, 0);
+    if (H.empty()) return std::numeric_limits<float>::max();
+
+    float total_err = 0.f;
+    for (size_t i = 0; i < board_pts.size(); ++i)
+    {
+        const cv::Mat pt = (cv::Mat_<double>(3, 1) << board_pts[i].x, board_pts[i].y, 1.0);
+        const cv::Mat proj = H * pt;
+        const float px = static_cast<float>(proj.at<double>(0) / proj.at<double>(2));
+        const float py = static_cast<float>(proj.at<double>(1) / proj.at<double>(2));
+        const float dx = px - remapped[i].x;
+        const float dy = py - remapped[i].y;
+        total_err += dx * dx + dy * dy;
+    }
+    return total_err / static_cast<float>(board_pts.size());
+}
+
 bool circlegrid::test_find_circles_grid(std::vector<int>& indices,
                                         const std::vector<base::MarkerCoding>& coding_markers,
-                                        const BoardCircleGrid& board)
+                                        const BoardCircleGrid& board,
+                                        TrackingState& tracker_state)
 {
-    const size_t total_expected_markers = board.rows_ * board.cols_;
-    if (coding_markers.size() < total_expected_markers)
+    const int total = board.rows_ * board.cols_;
+    if (static_cast<int>(coding_markers.size()) < total)
     {
+        spdlog::debug("test_find_circles_grid: insufficient markers: {} < {}", coding_markers.size(), total);
         return false;
     }
 
     // Convert markers to keypoints
     std::vector<cv::KeyPoint> keypoints;
     keypoints.reserve(coding_markers.size());
+    float max_x = 0.f, max_y = 0.f;
     for (const auto& marker : coding_markers)
     {
         const float size = static_cast<float>(marker.width_ring_ + marker.height_ring_) / 2.0f;
         keypoints.emplace_back(cv::Point2f(marker.col_, marker.row_), size);
+        max_x = std::max(max_x, marker.col_);
+        max_y = std::max(max_y, marker.row_);
     }
 
-    // Create a dummy image (findCirclesGrid needs an image for size info)
-    cv::Mat1b dummy_image = cv::Mat1b::zeros(1, 1);
-
-    // Create a blob detector that returns our pre-detected keypoints
-    cv::Ptr<cv::Feature2D> blob_detector = cv::makePtr<PredetectedBlobDetector>(keypoints);
+    // Create dummy image and run findCirclesGrid
+    const int img_w = static_cast<int>(std::ceil(max_x)) + 100;
+    const int img_h = static_cast<int>(std::ceil(max_y)) + 100;
+    cv::Mat1b dummy_image = cv::Mat1b::zeros(img_h, img_w);
 
     const cv::Size pattern_size(board.cols_, board.rows_);
+    const int base_flags = board.is_asymetric_ ? cv::CALIB_CB_ASYMMETRIC_GRID : cv::CALIB_CB_SYMMETRIC_GRID;
+
     std::vector<cv::Point2f> centers;
-    int flags = board.is_asymetric_ ? cv::CALIB_CB_ASYMMETRIC_GRID : cv::CALIB_CB_SYMMETRIC_GRID;
-    flags |= cv::CALIB_CB_CLUSTERING;  // Use clustering algorithm which works better with pre-detected points
+    bool found = false;
 
-    const bool success = cv::findCirclesGrid(dummy_image, pattern_size, centers, flags, blob_detector);
-    if (success)
+    // Try clustering first, then non-clustering
     {
-        indices.clear();
-        for (size_t idx_marker = 0; idx_marker < coding_markers.size(); ++idx_marker)
-        {
-            bool found = false;
-            const base::MarkerCoding& marker = coding_markers[idx_marker];
-            for (size_t idx_center = 0; idx_center < centers.size(); ++idx_center)
-            {
-                const cv::Point2f& center = centers[idx_center];
-                if (found = marker.row_ == center.y && marker.col_ == center.x; found)
-                {
-                    indices.push_back(int(idx_center));
-                    break;
-                }
-            }
+        cv::Ptr<cv::Feature2D> blob_detector = cv::makePtr<PredetectedBlobDetector>(keypoints);
+        found = cv::findCirclesGrid(dummy_image, pattern_size, centers, base_flags | cv::CALIB_CB_CLUSTERING, blob_detector);
+    }
+    if (!found)
+    {
+        cv::Ptr<cv::Feature2D> blob_detector = cv::makePtr<PredetectedBlobDetector>(keypoints);
+        found = cv::findCirclesGrid(dummy_image, pattern_size, centers, base_flags, blob_detector);
+    }
 
-            if (!found)
-            {
-                indices.push_back(-1);
-                spdlog::warn("Center id {} ({:0.1f}, {:0.1f}) was not identified!", idx_marker, marker.col_,
-                             marker.row_);
-            }
+    if (!found || static_cast<int>(centers.size()) != total)
+    {
+        spdlog::debug("test_find_circles_grid: findCirclesGrid failed ({} keypoints, pattern {}x{})",
+                      keypoints.size(), board.cols_, board.rows_);
+        return false;
+    }
+
+    // Fix asymmetric grid row ordering: OpenCV's findCirclesGrid may return odd rows before
+    // even rows. We try both orderings (original and row-pair-swapped) and pick the one with
+    // lower homography reprojection error against the board model.
+    if (board.is_asymetric_ && board.rows_ >= 2)
+    {
+        const int cols = board.cols_;
+        const int rows = board.rows_;
+
+        // Build row-pair-swapped version
+        std::vector<cv::Point2f> swapped(centers.size());
+        for (int i = 0; i < total; ++i)
+        {
+            const int det_row = i / cols;
+            const int det_col = i % cols;
+            int new_row = (det_row % 2 == 0) ? det_row + 1 : det_row - 1;
+            if (new_row >= rows) new_row = det_row;
+            swapped[new_row * cols + det_col] = centers[i];
         }
 
-        if (coding_markers.size() != indices.size())
+        // Compare homography fit for both orderings
+        const auto board_pts = compute_board_points(board);
+        const float cost_original = compute_orientation_cost(centers, board_pts, rows, cols, 0);
+        const float cost_swapped = compute_orientation_cost(swapped, board_pts, rows, cols, 0);
+
+        spdlog::info("test_find_circles_grid: row-pair cost original={:.1f}, swapped={:.1f}",
+                     cost_original, cost_swapped);
+
+        if (cost_swapped < cost_original * 0.9f)
         {
-            throw std::runtime_error(
-                std::format("Identified {} markers of {}!", indices.size(), coding_markers.size()));
+            spdlog::info("test_find_circles_grid: applying row-pair swap");
+            centers = swapped;
         }
     }
 
-    return success;
+    // Resolve 180° orientation ambiguity.
+    // findCirclesGrid can return the grid in two orientations (starting from opposite corners).
+    // For non-square grids, the homography cost distinguishes them.
+    // For near-square grids, both orientations have identical cost.
+    //
+    // Solution: store the first frame's board→image mapping as reference. For each subsequent
+    // frame, compare both orientations against the reference and pick the consistent one.
+    // The reference is stored as the set of (global_id → image_position) pairs.
+    const auto board_pts = compute_board_points(board);
+
+    // For non-square grids: use homography cost to pick orientation (decisive)
+    const float cost_identity = compute_orientation_cost(centers, board_pts, board.rows_, board.cols_, 0);
+    const float cost_flip180 = compute_orientation_cost(centers, board_pts, board.rows_, board.cols_, 1);
+
+    int best_orientation = 0;
+
+    if (cost_flip180 < cost_identity * 0.8f)
+    {
+        best_orientation = 1;
+    }
+    else if (cost_identity < cost_flip180 * 0.8f)
+    {
+        best_orientation = 0;
+    }
+    else
+    {
+        // Costs are similar (near-square grid): compare against a LOCKED reference.
+        // Use the previous findCirclesGrid frame's centers for comparison.
+        // Also maintain an immutable first-frame reference for robustness across restarts.
+        auto& prev_centers = tracker_state.prev_findcircles_centers_;
+
+        // Immutable reference: set once, never updated. Survives optimizer restarts
+        // because it's static (per-process, shared across all TrackingState instances).
+        static std::vector<cv::Point2f> immutable_reference;
+
+        if (immutable_reference.empty())
+        {
+            // Very first successful detection in this process — lock as reference
+            immutable_reference = apply_orientation(centers, board.rows_, board.cols_, 0);
+            prev_centers = immutable_reference;
+            best_orientation = 0;
+            spdlog::info("test_find_circles_grid: locked immutable 180° reference ({} centers)", total);
+        }
+        else
+        {
+            // Compare against immutable reference (robust across restarts)
+            const auto identity_centers = apply_orientation(centers, board.rows_, board.cols_, 0);
+            const auto flipped_centers = apply_orientation(centers, board.rows_, board.cols_, 1);
+
+            float cost_id = 0.f, cost_flip = 0.f;
+            for (int i = 0; i < total; ++i)
+            {
+                cost_id += static_cast<float>(cv::norm(identity_centers[i] - immutable_reference[i]));
+                cost_flip += static_cast<float>(cv::norm(flipped_centers[i] - immutable_reference[i]));
+            }
+
+            best_orientation = (cost_flip < cost_id) ? 1 : 0;
+
+            // Also update prev_centers for Hungarian tracking consistency
+            prev_centers = (best_orientation == 0) ? identity_centers : flipped_centers;
+        }
+    }
+
+    spdlog::debug("test_find_circles_grid: orientation={}", best_orientation == 0 ? "IDENTITY" : "FLIP_180");
+
+    // Apply the best orientation
+    const auto final_centers = apply_orientation(centers, board.rows_, board.cols_, best_orientation);
+    return populate_indices(indices, coding_markers, final_centers);
 }
 
 }  // namespace identification

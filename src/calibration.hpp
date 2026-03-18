@@ -140,9 +140,13 @@ class ImageDecoding
 
     const ValidityLocation validity_;
 
+    /// All detected coding markers (before identification), for visualization
+    const std::vector<MarkerCoding> all_detected_markers_;
+
     ImageDecoding(bool success, const cv::Mat1b &linear_input, const cv::Mat1b &binary, const cv::Mat1b &inverted_binary,
                   const Eigen::Matrix<std::optional<int>, -1, -1> &ordering, const std::vector<MarkerRing> &markers,
-                  const cv::Mat1b &markers_location, const cv::Mat1b &calibrated_area);
+                  const cv::Mat1b &markers_location, const cv::Mat1b &calibrated_area,
+                  const std::vector<MarkerCoding> &all_detected_markers = {});
 };
 
 }  // namespace base

@@ -1,9 +1,13 @@
 #pragma once
 
+#include <array>
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <opencv2/core.hpp>
+#include <opencv2/features2d.hpp>
 
 #include "board.hpp"
 #include "calibration.hpp"
@@ -13,74 +17,131 @@ class BoardCircleGrid;
 namespace identification::circlegrid
 {
 
+struct MarkerTrack
+{
+    std::array<cv::Point2f, 3> position_history{};
+    std::array<int, 3> frame_ids{};
+    int history_count = 0;  // 0-3 entries stored
+    cv::Point2f last_position;
+    int global_id = -1;
+    int last_seen_frame = 0;
+    int age = 0;
+};
+
+struct TrackingStatistics
+{
+    int frame_id = -1;
+    int detected_count = 0;
+    int identified_count = 0;
+    std::string method;
+    float avg_assignment_cost = 0.f;
+    float max_assignment_cost = 0.f;
+    bool was_180_flipped = false;
+    float mean_velocity_magnitude = 0.f;
+};
+
+struct HungarianTrackingResult
+{
+    std::vector<int> global_ids;
+    float avg_cost = 0.f;
+    float max_cost = 0.f;
+    int matched_count = 0;
+};
+
+/// ORB-based motion field for velocity interpolation
+struct ORBMotionField
+{
+    std::vector<cv::Point2f> locations;      // matched feature positions in current frame
+    std::vector<cv::Point2f> displacements;  // motion vectors (curr - prev)
+    bool valid = false;
+};
+
 struct TrackingState
 {
     std::vector<base::MarkerCoding> prev_markers_;
     std::vector<int> prev_global_ids_;
-    cv::Mat1b prev_image_;  // Store previous image for ECC validation
+    cv::Mat1b prev_image_;
     bool has_previous_ = false;
+
+    std::string last_method_;
+
+    // Per-global-id velocity tracks
+    std::unordered_map<int, MarkerTrack> tracks_;
+    bool orientation_locked_ = false;
+    int frame_counter_ = 0;
+
+    // For 180° ambiguity resolution across findCirclesGrid calls
+    std::vector<cv::Point2f> prev_findcircles_centers_;
+
+    // ORB motion field data
+    std::vector<cv::KeyPoint> prev_orb_keypoints_;
+    cv::Mat prev_orb_descriptors_;
 
     void update(const std::vector<base::MarkerCoding>& markers, const std::vector<int>& global_ids,
                 const cv::Mat1b& image);
     void clear();
+
+    /// Predict position for a tracked marker using up to 3 frames of history
+    cv::Point2f predict_position(int global_id, int current_frame) const;
+
+    /// Predict position with ORB-interpolated velocity for stale tracks
+    cv::Point2f predict_position_with_orb(int global_id, int current_frame,
+                                           const ORBMotionField& motion_field) const;
+
+    /// Estimate motion field from ORB features between prev and current image
+    ORBMotionField estimate_motion_field(const cv::Mat1b& current_image) const;
+
+    /// Update ORB keypoints after processing a frame
+    void update_orb(const cv::Mat1b& image);
+
+    /// Update velocity tracks after identification
+    void update_tracks(const std::vector<base::MarkerCoding>& markers, const std::vector<int>& global_ids);
 };
 
-/**
- * @brief Fallback identification using frame-to-frame tracking with KNN + RANSAC
- *
- * @param prev_markers Markers detected in previous frame
- * @param curr_markers Markers detected in current frame
- * @param prev_ids Global IDs of previous frame markers
- * @param distance_threshold Maximum distance for KNN matching
- * @param ransac_threshold RANSAC reprojection threshold
- * @return Vector of global IDs for current markers, or nullopt if tracking fails
- */
+// --- Existing functions ---
+
 std::optional<std::vector<int>> identify_with_tracking(const std::vector<base::MarkerCoding>& prev_markers,
                                                        const std::vector<base::MarkerCoding>& curr_markers,
                                                        const std::vector<int>& prev_ids, float distance_threshold,
                                                        float ransac_threshold);
 
-/**
- * @brief Identify new markers by fitting lines through identified markers in each row
- *
- * Uses the assumption that markers in the same row are collinear (small camera distortion).
- * For each unidentified marker, finds the closest row line and computes column offset
- * based on mean spacing between markers.
- *
- * @param markers Vector of markers to update (modifies global_id_ for new identifications)
- * @param board Board definition
- */
 void identify_new_markers_by_row_lines(std::vector<base::MarkerRing>& markers, const BoardCircleGrid& board);
 
-/**
- * @brief Tests if the detected markers can form a valid grid pattern using findCirclesGrid.
- *
- * @param indices global indices for each coding marker
- * @param coding_markers Detected coding markers
- * @param board Board definition
- * @return true if findCirclesGrid successfully detects the full pattern
- */
 bool test_find_circles_grid(std::vector<int>& indices, const std::vector<base::MarkerCoding>& coding_markers,
-                            const BoardCircleGrid& board);
+                            const BoardCircleGrid& board, TrackingState& tracker_state);
 
-/**
- * @brief Validates tracking using ECC metric after homography-based alignment.
- *
- * When marker count differs significantly between frames, uses BFMatcher correspondences
- * to compute homography, warps images, and computes ECC to validate alignment.
- *
- * @param prev_markers Markers from previous frame
- * @param curr_markers Markers from current frame
- * @param prev_image Previous frame image
- * @param curr_image Current frame image
- * @param distance_threshold Maximum distance for KNN matching
- * @param ransac_threshold RANSAC reprojection threshold
- * @param ecc_threshold Minimum ECC score to consider tracking valid
- * @return true if tracking alignment is valid (ECC >= threshold)
- */
 bool validate_tracking_with_ecc(const std::vector<base::MarkerCoding>& prev_markers,
                                 const std::vector<base::MarkerCoding>& curr_markers, const cv::Mat1b& prev_image,
                                 const cv::Mat1b& curr_image, float distance_threshold = 50.0f,
                                 float ransac_threshold = 5.0f, float ecc_threshold = 0.7f);
+
+// --- New functions ---
+
+/// Jonker-Volgenant O(n^3) assignment for rectangular cost matrices
+std::vector<int> hungarian_assignment(const std::vector<std::vector<float>>& cost_matrix, float max_cost);
+
+/// Velocity-predicted Hungarian tracking
+HungarianTrackingResult identify_with_hungarian_tracking(const TrackingState& state,
+                                                         const std::vector<base::MarkerCoding>& curr_markers,
+                                                         const BoardCircleGrid& board, float max_distance = 80.0f,
+                                                         float ransac_threshold = 5.0f,
+                                                         const ORBMotionField* motion_field = nullptr);
+
+/// Check if board has 180-degree rotational ambiguity
+bool board_has_180_ambiguity(const BoardCircleGrid& board);
+
+/// Compute 180-degree flipped global IDs
+std::vector<int> flip_ids_180(const std::vector<int>& global_ids, const BoardCircleGrid& board);
+
+/// Resolve 180-degree ambiguity using velocity consistency
+std::vector<int> resolve_180_ambiguity(const std::vector<int>& global_ids,
+                                       const std::vector<base::MarkerCoding>& curr_markers,
+                                       const TrackingState& state, const BoardCircleGrid& board);
+
+/// Re-identify unmatched markers using local homography (distortion-invariant)
+void identify_unmatched_by_local_homography(std::vector<base::MarkerRing>& markers, const BoardCircleGrid& board);
+
+/// Validate marker topology using RANSAC homography and correct row swaps
+void validate_and_correct_topology(std::vector<base::MarkerRing>& markers, const BoardCircleGrid& board);
 
 }  // namespace identification::circlegrid

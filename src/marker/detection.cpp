@@ -21,6 +21,30 @@
 namespace
 {
 
+std::string pth = "/home/kmro/praca/dev/kalibr-ws-dops/out/debug";
+
+void append_tracking_stats_csv(int frame_id, int detected_count, int identified_count, const std::string& method)
+{
+    const std::string dump_dir = []() -> std::string
+    {
+        const char* env = std::getenv("HEXRING_DEBUG_DIR");
+        return env ? env : "/tmp";
+    }();
+    const std::string filepath = dump_dir + "/tracking_stats.csv";
+
+    const bool file_exists = std::filesystem::exists(filepath);
+    std::ofstream ofs(filepath, std::ios::app);
+    if (!ofs.is_open())
+    {
+        return;
+    }
+    if (!file_exists)
+    {
+        ofs << "frame_id,detected_count,identified_count,method\n";
+    }
+    ofs << frame_id << "," << detected_count << "," << identified_count << "," << method << "\n";
+}
+
 cv::Mat1b binarize(cv::Mat1b &input, const marker::DetectionParameters &parameters)
 {
     auto thresholds = thresholds::thresholds(input, parameters.row_tiles_count_, parameters.col_tiles_count_);
@@ -440,7 +464,7 @@ void save_markers(const std::filesystem::path &output_path, const int image_idx,
     if (ofs.is_open())
     {
         ofs << markers_json.dump(2);
-        spdlog::debug("image {}: Saved identified markers to {}", image_idx, json_path.string());
+        spdlog::info("image {}: Saved identified markers to {}", image_idx, json_path.string());
     }
     else
     {
@@ -460,7 +484,7 @@ std::optional<base::ImageDecoding> detection::detect_and_identify(cv::Mat1b &inp
                                                                   const int image_idx,
                                                                   const std::filesystem::path &output_path)
 {
-    spdlog::debug("detecting markers in image {}", image_idx);
+    spdlog::info("detecting markers in image {}", image_idx);
 
     std::vector<base::MarkerCoding> best_coding;
     std::vector<base::MarkerRing> best_rings;
@@ -578,35 +602,34 @@ std::optional<base::ImageDecoding> detection::detect_and_identify(cv::Mat1b &inp
                                marker_area, calibrated_area);
 }
 
-base::ImageDecoding detection::detect_and_identify_circlegrid(
-    cv::Mat1b &input, const DetectionParameters &parameters, const BoardCircleGrid &board,
-    identification::circlegrid::TrackingState &tracker_state, const int image_idx,
-    const std::filesystem::path &output_path)
+base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, const DetectionParameters &parameters,
+                                                              const BoardCircleGrid &board,
+                                                              identification::circlegrid::TrackingState &tracker_state,
+                                                              const int image_idx,
+                                                              const std::filesystem::path &output_path)
 {
-    spdlog::debug("Detecting circle grid markers in image {}", image_idx);
+    spdlog::info("Detecting circle grid markers in image {}", image_idx);
+
+    // Declared before lambda so it can be captured by reference
+    std::vector<base::MarkerCoding> best_coding_markers;
 
     // Helper to create a failed result
     auto make_failed_result = [&](const cv::Mat1b &img, const cv::Mat1b &bin = cv::Mat1b(),
                                   const cv::Mat1b &inv_bin = cv::Mat1b(),
-                                  const std::vector<base::MarkerRing> &markers = {}) {
+                                  const std::vector<base::MarkerRing> &markers = {})
+    {
         Eigen::Matrix<std::optional<int>, -1, -1> empty_ordering =
             Eigen::Matrix<std::optional<int>, -1, -1>::Constant(board.rows_, board.cols_, std::nullopt);
         cv::Mat1b empty_area = cv::Mat1b::zeros(img.rows, img.cols);
         cv::Mat1b bin_to_use = bin.empty() ? empty_area : bin;
         cv::Mat1b inv_bin_to_use = inv_bin.empty() ? empty_area : inv_bin;
-        return base::ImageDecoding(false, img, bin_to_use, inv_bin_to_use,
-                                   empty_ordering, markers, empty_area, empty_area);
+        return base::ImageDecoding(false, img, bin_to_use, inv_bin_to_use, empty_ordering, markers, empty_area,
+                                   empty_area, best_coding_markers);
     };
-
-    if (image_idx == 671)
-    {
-        int aa = 5;
-    }
 
     const size_t total_expected_markers = board.rows_ * board.cols_;
 
     // Best result tracking - we keep only the best one to avoid memory issues with cv::Mat
-    std::vector<base::MarkerCoding> best_coding_markers;
     std::vector<int> best_indices;
     cv::Mat1b best_input;
     cv::Mat1b best_binarized;
@@ -652,9 +675,9 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(
         std::vector<int> indices_temp;
         const bool find_circles_grid_succeeded =
             coding_markers_temp.size() >= total_expected_markers &&
-            identification::circlegrid::test_find_circles_grid(indices_temp, coding_markers_temp, board);
+            identification::circlegrid::test_find_circles_grid(indices_temp, coding_markers_temp, board, tracker_state);
 
-        spdlog::debug("image {}: brightness scale {}: found {} coding markers, findCirclesGrid: {}", image_idx,
+        spdlog::info("image {}: brightness scale {}: found {} coding markers, findCirclesGrid: {}", image_idx,
                       brightness_scale, coding_markers_temp.size(), find_circles_grid_succeeded ? "PASS" : "FAIL");
 
         // Decide if this result is better than the current best
@@ -719,7 +742,7 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(
         return make_failed_result(input);
     }
 
-    spdlog::debug("image {}: selected brightness scale {} with {} markers (findCirclesGrid: {})", image_idx,
+    spdlog::info("image {}: selected brightness scale {} with {} markers (findCirclesGrid: {})", image_idx,
                   best_brightness_scale, best_coding_markers.size(),
                   best_find_circles_grid_succeeded ? "PASS" : "FAIL");
 
@@ -735,67 +758,132 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(
     }
 
     const bool primary_succeeded = best_find_circles_grid_succeeded;
+    std::string identification_method = primary_succeeded ? "findCirclesGrid" : "none";
 
     std::vector<int> global_ids = best_indices;
 
-    // Tracking is mandatory ONLY when less than total_expected_markers were detected
-    // (board has 35 markers, so partial visibility requires tracking)
-    // When we have >= 35 markers, the geometric identification should succeed
-    const bool tracking_mandatory = (coding_markers.size() < total_expected_markers);
+    // Orientation ambiguity is now resolved inside test_find_circles_grid via discrete optimization
+    // (trying all 4 orientations and picking the one with lowest homography reprojection error).
 
-    // Use tracking only if mandatory (fewer markers than expected) OR if primary identification failed
-    // but we have a previous frame and enough markers
-    const bool use_tracking =
-        tracking_mandatory || (!primary_succeeded && tracker_state.has_previous_ &&
-                               coding_markers.size() > size_t(float(total_expected_markers) * 0.3f));
+    // Count how many markers findCirclesGrid actually identified
+    const int primary_identified = primary_succeeded
+                                       ? static_cast<int>(std::count_if(global_ids.begin(), global_ids.end(),
+                                                                         [](int id) { return id >= 0; }))
+                                       : 0;
 
-    // Validate tracking with ECC to detect large jumps/movements that cause incorrect ID assignments
-    // Always validate when tracking is used to catch cases where board moved significantly
-    if (use_tracking && tracker_state.has_previous_)
+    // Use Hungarian tracking when findCirclesGrid failed or identified less than 50% of markers.
+    const bool primary_poor = !primary_succeeded || primary_identified < static_cast<int>(coding_markers.size()) / 2;
+    const bool use_tracking = primary_poor && tracker_state.has_previous_;
+
+    if (use_tracking)
     {
-        const bool tracking_valid = identification::circlegrid::validate_tracking_with_ecc(
-            tracker_state.prev_markers_, coding_markers, tracker_state.prev_image_, input, 50.0f, 5.0f, 0.7f);
+        spdlog::info("image {}: Using Hungarian tracking (primary_id={}, markers={}/{})", image_idx, primary_identified,
+                      coding_markers.size(), total_expected_markers);
 
-        if (!tracking_valid)
+        // ORB motion field disabled — causing bt0 regression. Need to investigate.
+        auto tracking_result = identification::circlegrid::identify_with_hungarian_tracking(
+            tracker_state, coding_markers, board, 80.0f, 5.0f, nullptr);
+
+        if (tracking_result.matched_count > primary_identified)
         {
-            spdlog::warn("image {}: ECC validation failed, clearing tracking state", image_idx);
-            tracker_state.clear();
-        }
-    }
+            // Resolve 180-degree ambiguity
+            tracking_result.global_ids = identification::circlegrid::resolve_180_ambiguity(
+                tracking_result.global_ids, coding_markers, tracker_state, board);
 
-    if (use_tracking && tracker_state.has_previous_)
-    {
-        spdlog::debug("image {}: Using tracking (reason: {}, markers={}/{})", image_idx,
-                      tracking_mandatory ? "fewer markers" : "identification failed", coding_markers.size(),
-                      total_expected_markers);
-
-        const auto tracking_result = identification::circlegrid::identify_with_tracking(
-            tracker_state.prev_markers_, coding_markers, tracker_state.prev_global_ids_, 50.0f, 5.0f);
-
-        if (tracking_result.has_value())
-        {
-            global_ids = *tracking_result;
+            global_ids = tracking_result.global_ids;
             const int identified_count =
                 static_cast<int>(std::count_if(global_ids.begin(), global_ids.end(), [](int id) { return id >= 0; }));
-            spdlog::debug("image {}: Tracking identified {} markers", image_idx, identified_count);
+            spdlog::info("image {}: Hungarian tracking identified {} markers (avg_cost={:.1f})", image_idx,
+                          identified_count, tracking_result.avg_cost);
+            identification_method = "hungarian";
+        }
+        else
+        {
+            // Hungarian didn't improve; fallback to KNN tracking
+            spdlog::debug("image {}: Hungarian tracking didn't improve ({}<={}), trying KNN fallback", image_idx,
+                          tracking_result.matched_count, primary_identified);
+            const auto knn_result = identification::circlegrid::identify_with_tracking(
+                tracker_state.prev_markers_, coding_markers, tracker_state.prev_global_ids_, 50.0f, 5.0f);
+            if (knn_result.has_value())
+            {
+                const int knn_count = static_cast<int>(
+                    std::count_if(knn_result->begin(), knn_result->end(), [](int id) { return id >= 0; }));
+                if (knn_count > primary_identified)
+                {
+                    global_ids = *knn_result;
+                    identification_method = "knn_fallback";
+                    spdlog::info("image {}: KNN fallback identified {} markers", image_idx, knn_count);
+                }
+            }
         }
     }
-    else if (tracking_mandatory && !tracker_state.has_previous_)
+    else if (primary_poor && !tracker_state.has_previous_)
     {
-        spdlog::warn("image {}: Tracking is mandatory but no previous frame available (markers={}/{})", image_idx,
-                     coding_markers.size(), total_expected_markers);
+        spdlog::warn("image {}: No previous frame for tracking (primary_id={}, markers={}/{})", image_idx,
+                     primary_identified, coding_markers.size(), total_expected_markers);
     }
 
     if (global_ids.empty())
     {
-        spdlog::warn("image {}: tracking failed", image_idx);
-        return make_failed_result(input, binarized, inverted_binarization);
+        global_ids.assign(coding_markers.size(), -1);
     }
 
     if (global_ids.size() != coding_markers.size())
     {
         throw std::runtime_error(std::format("Not all markers has asigned indices! , global_ids {}, coding_markers {}",
                                              global_ids.size(), coding_markers.size()));
+    }
+
+    // For Hungarian/KNN frames: compare marker IDs against previous frame's IDs
+    // using spatial matching. For consecutive frames, markers move <50px. If the
+    // current assignment is 180° flipped, the matched prev IDs will be complementary.
+    if (tracker_state.has_previous_ &&
+        (identification_method.find("hungarian") != std::string::npos ||
+         identification_method.find("knn") != std::string::npos))
+    {
+        const int total = board.rows_ * board.cols_;
+        int matches_original = 0;
+        int matches_flipped = 0;
+        int compared = 0;
+
+        for (size_t i = 0; i < coding_markers.size(); ++i)
+        {
+            if (global_ids[i] < 0) continue;
+            const int flipped_id = total - 1 - global_ids[i];
+
+            // Find nearest prev-frame marker by position
+            float best_dist = 50.f;
+            int best_prev_id = -1;
+            for (size_t j = 0; j < tracker_state.prev_markers_.size(); ++j)
+            {
+                if (tracker_state.prev_global_ids_[j] < 0) continue;
+                const float dx = coding_markers[i].col_ - tracker_state.prev_markers_[j].col_;
+                const float dy = coding_markers[i].row_ - tracker_state.prev_markers_[j].row_;
+                const float d = std::sqrt(dx * dx + dy * dy);
+                if (d < best_dist)
+                {
+                    best_dist = d;
+                    best_prev_id = tracker_state.prev_global_ids_[j];
+                }
+            }
+
+            if (best_prev_id >= 0)
+            {
+                ++compared;
+                if (global_ids[i] == best_prev_id) ++matches_original;
+                if (flipped_id == best_prev_id) ++matches_flipped;
+            }
+        }
+
+        if (compared >= 10 && matches_flipped > matches_original * 3)
+        {
+            spdlog::info("image {}: Hungarian 180° flip (orig={}, flip={}, cmp={}), correcting",
+                         image_idx, matches_original, matches_flipped, compared);
+            for (auto& gid : global_ids)
+            {
+                if (gid >= 0) gid = total - 1 - gid;
+            }
+        }
     }
 
     std::vector<base::MarkerRing> rings;
@@ -806,14 +894,32 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(
         rings.back().global_id_ = global_ids[i];
     }
 
-    const size_t prev_count = tracker_state.has_previous_ ? tracker_state.prev_markers_.size() : 0;
-    if (coding_markers.size() > prev_count && prev_count != 0)
+    // Always try to identify unmatched markers using local homography
+    const int unidentified_count =
+        static_cast<int>(std::count_if(rings.begin(), rings.end(), [](const auto& r) { return r.global_id_ < 0; }));
+    if (unidentified_count > 0)
     {
-        if (coding_markers.size() != total_expected_markers)
+        const int pre_count = static_cast<int>(rings.size()) - unidentified_count;
+        identification::circlegrid::identify_unmatched_by_local_homography(rings, board);
+        const int post_count = static_cast<int>(
+            std::count_if(rings.begin(), rings.end(), [](const auto& r) { return r.global_id_ >= 0; }));
+        if (post_count > pre_count)
         {
-            identification::circlegrid::identify_new_markers_by_row_lines(rings, board);
+            spdlog::info("image {}: Local homography identified {} additional markers", image_idx,
+                          post_count - pre_count);
+            if (identification_method == "none")
+            {
+                identification_method = "homography";
+            }
+            else
+            {
+                identification_method += "+homography";
+            }
         }
     }
+
+    // Orientation ambiguity and row swaps are handled by the discrete optimization
+    // in test_find_circles_grid (tries all 4 orientations, picks lowest reprojection error).
 
     std::vector<int> current_ids;
     current_ids.reserve(rings.size());
@@ -821,6 +927,7 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(
     {
         current_ids.push_back(r.global_id_);
     }
+    tracker_state.last_method_ = identification_method;
     tracker_state.update(coding_markers, current_ids, input);
 
     Eigen::Matrix<std::optional<int>, -1, -1> ordering =
@@ -840,11 +947,15 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(
     if (identified_markers == 0)
     {
         spdlog::warn("image {}: No circle grid markers identified", image_idx);
+        append_tracking_stats_csv(image_idx, static_cast<int>(coding_markers.size()), 0, "failed");
         return make_failed_result(input, binarized, inverted_binarization, rings);
     }
 
-    spdlog::debug("image {}: Final identification: {} / {} markers", image_idx, identified_markers,
-                  total_expected_markers);
+    spdlog::info("image {}: Final identification: {} / {} markers (method: {})", image_idx, identified_markers,
+                  total_expected_markers, identification_method);
+
+    append_tracking_stats_csv(image_idx, static_cast<int>(coding_markers.size()), identified_markers,
+                              identification_method);
 
     const cv::Mat1b marker_area = create_marker_area(rings, input.rows, input.cols);
     const cv::Mat1b calibrated_area =
@@ -852,19 +963,21 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(
 
     if constexpr (kShowMarkers)
     {
-        if (!output_path.empty())
-        {
-            save_markers(output_path, 99999, total_expected_markers, identified_markers, rings, board, input, ordering);
-            save_markers(output_path, image_idx, total_expected_markers, identified_markers, rings, board, input,
-                         ordering);
+        // if (!output_path.empty())
+        // {
+        save_markers(pth + "/markers-json/", 99999, total_expected_markers, identified_markers, rings, board, input,
+                     ordering);
+        save_markers(pth + "/markers-json/", image_idx, total_expected_markers, identified_markers, rings, board, input,
+                     ordering);
 
-            io::debug::save_image(marker_area, std::format("marker_area_circle_{}", image_idx), debug::kMarkersSubdir);
-            io::debug::save_image(calibrated_area, std::format("calibrated_area_circle_{}", image_idx),
-                                  debug::kMarkersSubdir);
-        }
+        io::debug::save_image(marker_area, std::format("marker_area_circle_{}", image_idx), "markers-png", pth);
+        io::debug::save_image(calibrated_area, std::format("calibrated_area_circle_{}", image_idx), "markers-png", pth);
+        //   static_assert(false);
+        // }
     }
 
-    return base::ImageDecoding(true, input, binarized, inverted_binarization, ordering, rings, marker_area, calibrated_area);
+    return base::ImageDecoding(true, input, binarized, inverted_binarization, ordering, rings, marker_area,
+                               calibrated_area, coding_markers);
 }
 
 }  // namespace marker

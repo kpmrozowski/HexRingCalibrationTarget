@@ -121,12 +121,14 @@ base::ImageDecoding::ImageDecoding(bool success, const cv::Mat1b &linear_input, 
                                    const cv::Mat1b &inverted_binary,
                                    const Eigen::Matrix<std::optional<int>, -1, -1> &ordering,
                                    const std::vector<base::MarkerRing> &markers, const cv::Mat1b &markers_location,
-                                   const cv::Mat1b &calibrated_area)
+                                   const cv::Mat1b &calibrated_area,
+                                   const std::vector<base::MarkerCoding> &all_detected_markers)
     : success_(success),
       linear_input_(linear_input),
       binary_(binary),
       inverted_binary_(inverted_binary),
       coding_markers_(ordering, markers),
-      validity_(markers_location, calibrated_area)
+      validity_(markers_location, calibrated_area),
+      all_detected_markers_(all_detected_markers)
 {
 }
