@@ -22,8 +22,9 @@
 namespace
 {
 
-// Default debug path, overridden by output_path parameter in detect_and_identify_circlegrid()
-std::string pth = "out/debug";
+// Debug output path. Set from output_path parameter in detect_and_identify_circlegrid().
+// Empty string disables debug file output (CSV, JSON).
+std::string pth;
 
 void append_tracking_stats_csv(int frame_id, int detected_count, int identified_count,
                                const std::string& method,
@@ -1470,20 +1471,19 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
         }
     }
 
-    // Compute board aspect ratio for near-square guard (used by multiple filters below)
-    const float board_width = board.is_asymetric_
-        ? static_cast<float>((2 * (board.cols_ - 1) + 1) * board.spacing_)
-        : static_cast<float>((board.cols_ - 1) * board.spacing_);
-    const float board_height = static_cast<float>((board.rows_ - 1) * board.spacing_);
-    const float aspect = std::max(board_width, board_height) / std::max(1.f, std::min(board_width, board_height));
-    const bool is_near_square = aspect < 1.3f;
+    // Check if grid has 180° orientation ambiguity (used by multiple filters below).
+    // Ambiguity exists when rows is even (asymmetric) or both rows and cols even (regular).
+    // This replaces the previous "near-square aspect < 1.3" heuristic.
+    const bool has_180_ambiguity = board.is_asymetric_
+        ? (board.rows_ % 2 == 0)
+        : (board.rows_ % 2 == 0 && board.cols_ % 2 == 0);
 
     // Mark homography-added markers and verify them against velocity field.
     // The homography step can re-introduce swapped markers that were correctly
     // rejected by the velocity acceptance check. Re-check newly-added markers.
     // Post-homography velocity check DISABLED: causes cascading tracker divergence
     // on fast-moving boards. The RANSAC outlier removal (below) provides equivalent protection.
-    if (false && is_near_square && tracker_state.forward_blob_field_.valid && tracker_state.backward_blob_field_.valid)
+    if (false && has_180_ambiguity && tracker_state.forward_blob_field_.valid && tracker_state.backward_blob_field_.valid)
     {
         const float img_short = static_cast<float>(std::min(input.cols, input.rows));
         const float abs_cap = 0.05f * img_short;
@@ -1620,8 +1620,8 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
     // Disappeared-neighbor swap detection: if gid X is assigned to a marker at
     // approximately the PREVIOUS position of gid Y (a hex neighbor),
     // and gid Y is NOT in the current frame, then gid X likely stole gid Y's marker.
-    // Only run on near-square grids where row swaps actually occur.
-    if (tracker_state.has_previous_ && identification_method != "findCirclesGrid" && is_near_square)
+    // Only run on grids with 180° ambiguity (even rows) where swaps can occur.
+    if (tracker_state.has_previous_ && identification_method != "findCirclesGrid" && has_180_ambiguity)
     {
         const int total = board.rows_ * board.cols_;
 
@@ -1940,7 +1940,7 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
 
     // Write per-frame debug CSV with per-marker filter decisions.
     // One CSV per frame: <debug_dir>/filter-csv/frame_NNNNNN.csv
-    {
+    if (!pth.empty()) {
         static const std::string csv_dir = [&]() {
             const std::string d = pth + "/filter-csv";
             std::filesystem::create_directories(d);
@@ -2041,7 +2041,7 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
                     << frame_reproj_mean << ',' << frame_reproj_max << '\n';
             }
         }
-    }
+    } // !pth.empty() guard for CSV
 
     tracker_state.update(coding_markers, current_ids, input);
 
@@ -2086,8 +2086,7 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
 
     if constexpr (kShowMarkers)
     {
-        // if (!output_path.empty())
-        // {
+        if (!pth.empty()) {
         save_markers(pth + "/markers-json/", 99999, total_expected_markers, identified_markers, rings, board, input,
                      ordering);
         save_markers(pth + "/markers-json/", image_idx, total_expected_markers, identified_markers, rings, board, input,
@@ -2095,8 +2094,7 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
 
         io::debug::save_image(marker_area, std::format("marker_area_circle_{}", image_idx), "markers-png", pth);
         io::debug::save_image(calibrated_area, std::format("calibrated_area_circle_{}", image_idx), "markers-png", pth);
-        //   static_assert(false);
-        // }
+        } // !pth.empty()
     }
 
     return base::ImageDecoding(true, input, binarized, inverted_binarization, ordering, rings, marker_area,

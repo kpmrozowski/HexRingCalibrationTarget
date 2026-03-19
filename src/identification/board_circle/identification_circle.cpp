@@ -1397,15 +1397,10 @@ HungarianTrackingResult circlegrid::identify_with_hungarian_tracking(const Track
             result.max_cost = max_cost_val;
 
             // Bidirectional blob-velocity acceptance check.
-            // Only apply on near-square grids where row/col swaps actually occur.
-            // Non-square grids (5x7, aspect>1.3) don't suffer from orientation ambiguity.
-            const float board_width = board.is_asymetric_
-                ? static_cast<float>((2 * (board.cols_ - 1) + 1) * board.spacing_)
-                : static_cast<float>((board.cols_ - 1) * board.spacing_);
-            const float board_height = static_cast<float>((board.rows_ - 1) * board.spacing_);
-            const float board_aspect = std::max(board_width, board_height)
-                / std::max(1.f, std::min(board_width, board_height));
-            const bool board_is_near_square = board_aspect < 1.3f;
+            // Only apply on grids with 180° ambiguity (even rows for asymmetric grids).
+            const bool has_180_ambiguity = board.is_asymetric_
+                ? (board.rows_ % 2 == 0)
+                : (board.rows_ % 2 == 0 && board.cols_ % 2 == 0);
 
             const float img_short_edge = static_cast<float>(
                 std::min(state.prev_image_.cols, state.prev_image_.rows));
@@ -1416,7 +1411,7 @@ HungarianTrackingResult circlegrid::identify_with_hungarian_tracking(const Track
             // outlier removal catches remaining errors. The velocity check was too aggressive
             // for fast-moving boards (16-50px prediction error) and caused cascading tracker
             // divergence on n1c/n2c. The disappeared-neighbor check still catches swap errors.
-            if (false && board_is_near_square &&
+            if (false && has_180_ambiguity &&
                 state.forward_blob_field_.valid && state.backward_blob_field_.valid && absolute_cap > 0.f)
             {
                 for (size_t k = 0; k < matches.size(); ++k)
@@ -1618,23 +1613,21 @@ void circlegrid::identify_unmatched_by_local_homography(std::vector<base::Marker
     }
 
     // Require sufficient seed markers for reliable homography.
-    // Near-square grids need more seeds because the homography is prone to
-    // fitting swapped configurations. Non-square grids are safer with fewer seeds.
-    const float bw = board.is_asymetric_
-        ? static_cast<float>((2 * (board.cols_ - 1) + 1) * board.spacing_)
-        : static_cast<float>((board.cols_ - 1) * board.spacing_);
-    const float bh = static_cast<float>((board.rows_ - 1) * board.spacing_);
-    const float board_aspect = std::max(bw, bh) / std::max(1.f, std::min(bw, bh));
+    // Grids with 180° ambiguity (even rows) need more seeds because the homography
+    // is prone to fitting swapped configurations. Unambiguous grids are safer with fewer seeds.
+    const bool ambiguous = board.is_asymetric_
+        ? (board.rows_ % 2 == 0)
+        : (board.rows_ % 2 == 0 && board.cols_ % 2 == 0);
     const int total_markers = board.rows_ * board.cols_;
-    // Near-square: 25% of total (seed validation catches bad IDs via RANSAC reproj).
-    // Non-square: fixed 8.
-    const int min_seeds = board_aspect < 1.3f
+    // Ambiguous: 25% of total (seed validation catches bad IDs via RANSAC reproj).
+    // Unambiguous: fixed 8.
+    const int min_seeds = ambiguous
         ? std::max(8, static_cast<int>(total_markers * 0.25f))
         : 8;
     if (static_cast<int>(board_pts.size()) < min_seeds)
     {
-        spdlog::debug("Local homography: only {} identified markers, need {}+ (aspect={:.1f})",
-                       board_pts.size(), min_seeds, board_aspect);
+        spdlog::debug("Local homography: only {} identified markers, need {}+ (ambiguous={})",
+                       board_pts.size(), min_seeds, ambiguous);
         return;
     }
 
@@ -1797,14 +1790,9 @@ void circlegrid::identify_unmatched_by_local_homography(std::vector<base::Marker
         }
 
         // Try local homography (4 closest identified neighbors).
-        // Disabled for near-square grids: local H from 4 neighbors propagates
-        // errors when seeds have wrong gids (common on 10x7 boards).
-        const float bw = board.is_asymetric_
-            ? static_cast<float>((2 * (board.cols_ - 1) + 1) * board.spacing_)
-            : static_cast<float>((board.cols_ - 1) * board.spacing_);
-        const float bh = static_cast<float>((board.rows_ - 1) * board.spacing_);
-        const float board_aspect = std::max(bw, bh) / std::max(1.f, std::min(bw, bh));
-        const bool local_h_allowed = board_aspect >= 1.3f;  // only for non-square grids
+        // Disabled for grids with 180° ambiguity (even rows): local H from 4 neighbors
+        // propagates errors when seeds have wrong gids due to orientation confusion.
+        const bool local_h_allowed = !ambiguous;
 
         if (best_gid < 0 && local_h_allowed && identified_indices.size() >= 4)
         {
