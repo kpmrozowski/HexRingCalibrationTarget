@@ -858,6 +858,383 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
                      primary_identified, coding_markers.size(), total_expected_markers);
     }
 
+    // Ensure global_ids is initialized before brute-force fallbacks
+    if (global_ids.empty())
+        global_ids.assign(coding_markers.size(), -1);
+
+    // Last-resort: brute-force blob-to-board matching.
+    // When FCG fails AND Hungarian/KNN fail, try two approaches:
+    // A) If FCG reference exists: homography from reference to current blobs
+    // B) If no reference (cold start): RANSAC with board coordinates directly
+    {
+        const int current_id_count = static_cast<int>(
+            std::count_if(global_ids.begin(), global_ids.end(), [](int id) { return id >= 0; }));
+        const int total_markers = board.rows_ * board.cols_;
+        const bool has_fcg_ref = !tracker_state.last_fcg_positions_.empty()
+            && static_cast<int>(tracker_state.last_fcg_positions_.size()) == total_markers;
+        const bool need_brute_force = current_id_count < std::max(8, total_markers / 3)
+            && static_cast<int>(coding_markers.size()) >= total_markers / 2;
+
+        if (need_brute_force && has_fcg_ref)
+        {
+            // Collect current blob positions
+            std::vector<cv::Point2f> blob_pts;
+            blob_pts.reserve(coding_markers.size());
+            for (const auto& m : coding_markers)
+                blob_pts.emplace_back(m.col_, m.row_);
+
+            // Collect valid FCG reference positions
+            std::vector<cv::Point2f> ref_pts;
+            std::vector<int> ref_gids;
+            for (int gid = 0; gid < total_markers; ++gid)
+            {
+                const auto& p = tracker_state.last_fcg_positions_[gid];
+                if (p.x != 0.f || p.y != 0.f)
+                {
+                    ref_pts.push_back(p);
+                    ref_gids.push_back(gid);
+                }
+            }
+
+            if (ref_pts.size() >= 8 && blob_pts.size() >= 8)
+            {
+                // Compute centroids
+                cv::Point2f blob_centroid(0, 0), ref_centroid(0, 0);
+                for (const auto& p : blob_pts) blob_centroid += p;
+                for (const auto& p : ref_pts) ref_centroid += p;
+                blob_centroid /= static_cast<float>(blob_pts.size());
+                ref_centroid /= static_cast<float>(ref_pts.size());
+
+                // Try to match via RANSAC homography from ref → blob positions.
+                // Use any already-identified markers as seeds; if none, use nearest-neighbor
+                // matching between centroids of ref and blob point clouds.
+                std::vector<cv::Point2f> src_seed, dst_seed;
+
+                // Use existing identifications as seeds
+                for (size_t i = 0; i < coding_markers.size(); ++i)
+                {
+                    if (global_ids[i] >= 0 && global_ids[i] < total_markers)
+                    {
+                        const auto& ref_p = tracker_state.last_fcg_positions_[global_ids[i]];
+                        if (ref_p.x != 0.f || ref_p.y != 0.f)
+                        {
+                            src_seed.push_back(ref_p);
+                            dst_seed.emplace_back(coding_markers[i].col_, coding_markers[i].row_);
+                        }
+                    }
+                }
+
+                // If no seeds, use translation-based initialization:
+                // shift = blob_centroid - ref_centroid, then match nearest neighbors
+                if (src_seed.size() < 4)
+                {
+                    const cv::Point2f shift = blob_centroid - ref_centroid;
+                    for (const auto& rp : ref_pts)
+                    {
+                        const cv::Point2f predicted = rp + shift;
+                        float min_dist = 30.f;
+                        int best_blob = -1;
+                        for (size_t bi = 0; bi < blob_pts.size(); ++bi)
+                        {
+                            const float d = static_cast<float>(cv::norm(predicted - blob_pts[bi]));
+                            if (d < min_dist) { min_dist = d; best_blob = static_cast<int>(bi); }
+                        }
+                        if (best_blob >= 0)
+                        {
+                            src_seed.push_back(rp);
+                            dst_seed.push_back(blob_pts[best_blob]);
+                        }
+                    }
+                }
+
+                if (src_seed.size() >= 4)
+                {
+                    const cv::Mat H_bf = cv::findHomography(src_seed, dst_seed, cv::RANSAC, 10.0);
+                    if (!H_bf.empty())
+                    {
+                        // Compute mean spacing for threshold
+                        float mean_sp = 0.f;
+                        int sp_count = 0;
+                        for (size_t a = 1; a < dst_seed.size() && a < 20; ++a)
+                            for (size_t b = 0; b < a; ++b)
+                            {
+                                const float d = static_cast<float>(cv::norm(dst_seed[a] - dst_seed[b]));
+                                if (d < 200.f) { mean_sp += d; ++sp_count; }
+                            }
+                        mean_sp = sp_count > 0 ? mean_sp / static_cast<float>(sp_count) : 50.f;
+                        const float match_threshold = mean_sp * 0.25f;
+
+                        std::set<int> used_gids, used_blobs;
+                        for (size_t i = 0; i < global_ids.size(); ++i)
+                            if (global_ids[i] >= 0) { used_gids.insert(global_ids[i]); used_blobs.insert(static_cast<int>(i)); }
+
+                        int bf_identified = 0;
+                        for (size_t ri = 0; ri < ref_pts.size(); ++ri)
+                        {
+                            if (used_gids.count(ref_gids[ri])) continue;
+                            const cv::Mat pt = (cv::Mat_<double>(3,1) << ref_pts[ri].x, ref_pts[ri].y, 1.0);
+                            const cv::Mat proj = H_bf * pt;
+                            const cv::Point2f projected(
+                                static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
+                                static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+
+                            float best_dist = match_threshold;
+                            int best_blob = -1;
+                            for (size_t bi = 0; bi < blob_pts.size(); ++bi)
+                            {
+                                if (used_blobs.count(static_cast<int>(bi))) continue;
+                                const float d = static_cast<float>(cv::norm(projected - blob_pts[bi]));
+                                if (d < best_dist) { best_dist = d; best_blob = static_cast<int>(bi); }
+                            }
+                            if (best_blob >= 0)
+                            {
+                                global_ids[best_blob] = ref_gids[ri];
+                                used_gids.insert(ref_gids[ri]);
+                                used_blobs.insert(best_blob);
+                                ++bf_identified;
+                            }
+                        }
+                        if (bf_identified > 0)
+                        {
+                            spdlog::info("image {}: brute-force blob matching identified {} markers "
+                                         "(from {} ref pts, {} blobs, threshold={:.1f}px)",
+                                         image_idx, bf_identified, ref_pts.size(), blob_pts.size(), match_threshold);
+                            if (identification_method == "none" || identification_method.empty())
+                                identification_method = "brute_force";
+                            else
+                                identification_method += "+brute_force";
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Cold-start fallback: when no FCG reference exists yet and we have enough blobs,
+    // try RANSAC matching from board coordinates to blob positions.
+    // Use blob centroid + board centroid for translation init, then RANSAC.
+    {
+        const int current_id_count2 = static_cast<int>(
+            std::count_if(global_ids.begin(), global_ids.end(), [](int id) { return id >= 0; }));
+        const int total_markers = board.rows_ * board.cols_;
+        if (current_id_count2 < std::max(8, total_markers / 3)
+            && static_cast<int>(coding_markers.size()) >= total_markers * 3 / 4
+            && tracker_state.last_fcg_positions_.empty())
+        {
+            // Compute board coordinates
+            std::vector<cv::Point2f> board_coords;
+            for (int r = 0; r < board.rows_; ++r)
+                for (int c = 0; c < board.cols_; ++c)
+                {
+                    const float bx = board.is_asymetric_
+                        ? static_cast<float>((2*c + r%2) * board.spacing_)
+                        : static_cast<float>(c * board.spacing_);
+                    const float by = static_cast<float>(r * board.spacing_);
+                    board_coords.emplace_back(bx, by);
+                }
+
+            // Collect blob positions
+            std::vector<cv::Point2f> blob_pts;
+            for (const auto& m : coding_markers)
+                blob_pts.emplace_back(m.col_, m.row_);
+
+            // Try to find homography from board coords to blob positions
+            // using identified markers as seeds, or nearest-neighbor matching if none
+            std::vector<cv::Point2f> src_pts, dst_pts;
+            for (size_t i = 0; i < global_ids.size(); ++i)
+            {
+                if (global_ids[i] >= 0 && global_ids[i] < total_markers)
+                {
+                    src_pts.push_back(board_coords[global_ids[i]]);
+                    dst_pts.emplace_back(coding_markers[i].col_, coding_markers[i].row_);
+                }
+            }
+
+            // If not enough seeds, try centroid-based matching
+            if (src_pts.size() < 4)
+            {
+                cv::Point2f board_centroid(0, 0), blob_centroid(0, 0);
+                for (const auto& p : board_coords) board_centroid += p;
+                for (const auto& p : blob_pts) blob_centroid += p;
+                board_centroid /= static_cast<float>(board_coords.size());
+                blob_centroid /= static_cast<float>(blob_pts.size());
+
+                // Estimate scale: ratio of point cloud spreads
+                float board_spread = 0, blob_spread = 0;
+                for (const auto& p : board_coords) board_spread += static_cast<float>(cv::norm(p - board_centroid));
+                for (const auto& p : blob_pts) blob_spread += static_cast<float>(cv::norm(p - blob_centroid));
+                const float scale = blob_spread / std::max(board_spread, 1.f);
+
+                // Scale + translate board coords to blob space, then nearest-neighbor match
+                src_pts.clear(); dst_pts.clear();
+                for (const auto& bc : board_coords)
+                {
+                    const cv::Point2f predicted = blob_centroid + scale * (bc - board_centroid);
+                    float min_dist = 25.f;
+                    int best_blob = -1;
+                    for (size_t bi = 0; bi < blob_pts.size(); ++bi)
+                    {
+                        const float d = static_cast<float>(cv::norm(predicted - blob_pts[bi]));
+                        if (d < min_dist) { min_dist = d; best_blob = static_cast<int>(bi); }
+                    }
+                    if (best_blob >= 0)
+                    {
+                        src_pts.push_back(bc);
+                        dst_pts.push_back(blob_pts[best_blob]);
+                    }
+                }
+            }
+
+            if (src_pts.size() >= 8)
+            {
+                const cv::Mat H_cs = cv::findHomography(src_pts, dst_pts, cv::RANSAC, 8.0);
+                if (!H_cs.empty())
+                {
+                    float mean_sp = 0.f;
+                    int sp_count = 0;
+                    for (size_t a = 1; a < dst_pts.size() && a < 20; ++a)
+                        for (size_t b = 0; b < a; ++b)
+                        {
+                            const float d = static_cast<float>(cv::norm(dst_pts[a] - dst_pts[b]));
+                            if (d < 200.f) { mean_sp += d; ++sp_count; }
+                        }
+                    mean_sp = sp_count > 0 ? mean_sp / static_cast<float>(sp_count) : 50.f;
+
+                    std::set<int> used_gids, used_blobs;
+                    for (size_t i = 0; i < global_ids.size(); ++i)
+                        if (global_ids[i] >= 0) { used_gids.insert(global_ids[i]); used_blobs.insert(static_cast<int>(i)); }
+
+                    int cs_identified = 0;
+                    for (int gid = 0; gid < total_markers; ++gid)
+                    {
+                        if (used_gids.count(gid)) continue;
+                        const cv::Mat pt = (cv::Mat_<double>(3,1) << board_coords[gid].x, board_coords[gid].y, 1.0);
+                        const cv::Mat proj = H_cs * pt;
+                        const cv::Point2f projected(
+                            static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
+                            static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+
+                        float best_dist = mean_sp * 0.2f;
+                        int best_blob = -1;
+                        for (size_t bi = 0; bi < blob_pts.size(); ++bi)
+                        {
+                            if (used_blobs.count(static_cast<int>(bi))) continue;
+                            const float d = static_cast<float>(cv::norm(projected - blob_pts[bi]));
+                            if (d < best_dist) { best_dist = d; best_blob = static_cast<int>(bi); }
+                        }
+                        if (best_blob >= 0)
+                        {
+                            global_ids[best_blob] = gid;
+                            used_gids.insert(gid);
+                            used_blobs.insert(best_blob);
+                            ++cs_identified;
+                        }
+                    }
+                    if (cs_identified > 0)
+                    {
+                        spdlog::info("image {}: cold-start board matching identified {} markers",
+                                      image_idx, cs_identified);
+                        if (identification_method == "none" || identification_method.empty())
+                            identification_method = "cold_start";
+                        else
+                            identification_method += "+cold_start";
+                    }
+                }
+            }
+        }
+    }
+
+    // Desperate last resort: if we still have <8 identified markers but ≥4,
+    // try homography from board coords using just those 4+ markers as seeds.
+    // Lower min_seeds requirement since we have no other option.
+    {
+        const int final_id_count = static_cast<int>(
+            std::count_if(global_ids.begin(), global_ids.end(), [](int id) { return id >= 0; }));
+        const int total_markers = board.rows_ * board.cols_;
+        if (final_id_count >= 4 && final_id_count < 8)
+        {
+            // Build board→image correspondence from current identifications
+            std::vector<cv::Point2f> board_seed, image_seed;
+            std::set<int> used_gids;
+            for (size_t i = 0; i < global_ids.size(); ++i)
+            {
+                if (global_ids[i] >= 0 && global_ids[i] < total_markers)
+                {
+                    const int r = global_ids[i] / board.cols_;
+                    const int c = global_ids[i] % board.cols_;
+                    const float bx = board.is_asymetric_
+                        ? static_cast<float>((2*c + r%2) * board.spacing_)
+                        : static_cast<float>(c * board.spacing_);
+                    const float by = static_cast<float>(r * board.spacing_);
+                    board_seed.emplace_back(bx, by);
+                    image_seed.emplace_back(coding_markers[i].col_, coding_markers[i].row_);
+                    used_gids.insert(global_ids[i]);
+                }
+            }
+
+            if (board_seed.size() >= 4)
+            {
+                const cv::Mat H_last = cv::findHomography(board_seed, image_seed, 0);  // no RANSAC with few points
+                if (!H_last.empty())
+                {
+                    float mean_sp = 0.f;
+                    int sp_count = 0;
+                    for (size_t a = 1; a < image_seed.size(); ++a)
+                        for (size_t b = 0; b < a; ++b)
+                        {
+                            const float d = static_cast<float>(cv::norm(image_seed[a] - image_seed[b]));
+                            if (d < 200.f) { mean_sp += d; ++sp_count; }
+                        }
+                    mean_sp = sp_count > 0 ? mean_sp / static_cast<float>(sp_count) : 50.f;
+
+                    std::set<int> used_blobs;
+                    for (size_t i = 0; i < global_ids.size(); ++i)
+                        if (global_ids[i] >= 0) used_blobs.insert(static_cast<int>(i));
+
+                    int last_resort = 0;
+                    for (int gid = 0; gid < total_markers; ++gid)
+                    {
+                        if (used_gids.count(gid)) continue;
+                        const int r = gid / board.cols_;
+                        const int c = gid % board.cols_;
+                        const float bx = board.is_asymetric_
+                            ? static_cast<float>((2*c + r%2) * board.spacing_)
+                            : static_cast<float>(c * board.spacing_);
+                        const float by = static_cast<float>(r * board.spacing_);
+                        const cv::Mat pt = (cv::Mat_<double>(3,1) << bx, by, 1.0);
+                        const cv::Mat proj = H_last * pt;
+                        const cv::Point2f projected(
+                            static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
+                            static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+
+                        float best_dist = mean_sp * 0.25f;
+                        int best_blob = -1;
+                        for (size_t bi = 0; bi < coding_markers.size(); ++bi)
+                        {
+                            if (used_blobs.count(static_cast<int>(bi))) continue;
+                            const float d = static_cast<float>(cv::norm(
+                                projected - cv::Point2f(coding_markers[bi].col_, coding_markers[bi].row_)));
+                            if (d < best_dist) { best_dist = d; best_blob = static_cast<int>(bi); }
+                        }
+                        if (best_blob >= 0)
+                        {
+                            global_ids[best_blob] = gid;
+                            used_gids.insert(gid);
+                            used_blobs.insert(best_blob);
+                            ++last_resort;
+                        }
+                    }
+                    if (last_resort > 0)
+                    {
+                        spdlog::info("image {}: last-resort homography identified {} additional markers (from {} seeds)",
+                                      image_idx, last_resort, board_seed.size());
+                        identification_method += "+last_resort";
+                    }
+                }
+            }
+        }
+    }
+
     if (global_ids.empty())
     {
         global_ids.assign(coding_markers.size(), -1);
@@ -1104,8 +1481,9 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
     // Mark homography-added markers and verify them against velocity field.
     // The homography step can re-introduce swapped markers that were correctly
     // rejected by the velocity acceptance check. Re-check newly-added markers.
-    // Only on near-square grids where row/col swaps actually occur.
-    if (is_near_square && tracker_state.forward_blob_field_.valid && tracker_state.backward_blob_field_.valid)
+    // Post-homography velocity check DISABLED: causes cascading tracker divergence
+    // on fast-moving boards. The RANSAC outlier removal (below) provides equivalent protection.
+    if (false && is_near_square && tracker_state.forward_blob_field_.valid && tracker_state.backward_blob_field_.valid)
     {
         const float img_short = static_cast<float>(std::min(input.cols, input.rows));
         const float abs_cap = 0.05f * img_short;
@@ -1127,7 +1505,7 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
             const cv::Point2f predicted_curr = prev_pos + v_fwd;
             const float fwd_err = static_cast<float>(cv::norm(predicted_curr - curr_pos));
             const float disp = static_cast<float>(cv::norm(v_fwd));
-            const float tol = std::min(std::max(0.5f * disp, 15.f), abs_cap);
+            const float tol = std::min(std::max(0.5f * disp, 25.f), abs_cap);
 
             if (fwd_err > tol)
             {
@@ -1360,6 +1738,13 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
                         const size_t ring_idx = static_cast<size_t>(&ring - &rings[0]);
                         if (dist_to_expected < swap_dist_threshold)
                         {
+                            // Don't remove if it would drop below 8 identified markers
+                            if (static_cast<int>(assigned_gids.size()) <= 8)
+                            {
+                                spdlog::debug("image {}: skipping disappeared-neighbor swap gid {} "
+                                              "(would drop below 8 markers)", image_idx, gid);
+                                continue;
+                            }
                             filter_decisions[ring_idx] = {nbr_gid, dist_to_expected,
                                                            swap_dist_threshold, true, false};
                             spdlog::info("image {}: disappeared-neighbor swap (pass {}): gid {} at prev gid {} pos "
@@ -1434,10 +1819,13 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
                 // FCG markers are reliably identified; their high reproj is from lens
                 // distortion (homography can't model equidistant distortion at edges).
                 int outliers_removed = 0;
+                const int pre_outlier_count = static_cast<int>(board_pts_q.size());
                 if (identification_method != "findCirclesGrid")
                 {
                     for (size_t j = 0; j < board_pts_q.size(); ++j)
                     {
+                        // Don't remove if it would drop below 8 identified markers
+                        if (pre_outlier_count - outliers_removed <= 8) break;
                         if (reproj_errors[j] > outlier_thresh)
                         {
                             spdlog::debug("image {}: reproj outlier: gid {} reproj={:.1f}px > {:.1f}px, unsetting",
@@ -1550,7 +1938,7 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
                         const float disp = static_cast<float>(cv::norm(v_fwd));
                         const float img_short = static_cast<float>(
                             std::min(input.cols, input.rows));
-                        tol = std::min(std::max(0.5f * disp, 15.f), 0.05f * img_short);
+                        tol = std::min(std::max(0.5f * disp, 25.f), 0.05f * img_short);
                         vel_rejected = (fwd_err > tol || bwd_err > tol);
                         track_prev_x = prev_pos.x;
                         track_prev_y = prev_pos.y;

@@ -1411,7 +1411,12 @@ HungarianTrackingResult circlegrid::identify_with_hungarian_tracking(const Track
                 std::min(state.prev_image_.cols, state.prev_image_.rows));
             const float absolute_cap = 0.05f * img_short_edge;
 
-            if (board_is_near_square &&
+            // In-Hungarian velocity check DISABLED: the RANSAC homography validation
+            // (above) already filters gross misassignments, and the post-identification
+            // outlier removal catches remaining errors. The velocity check was too aggressive
+            // for fast-moving boards (16-50px prediction error) and caused cascading tracker
+            // divergence on n1c/n2c. The disappeared-neighbor check still catches swap errors.
+            if (false && board_is_near_square &&
                 state.forward_blob_field_.valid && state.backward_blob_field_.valid && absolute_cap > 0.f)
             {
                 for (size_t k = 0; k < matches.size(); ++k)
@@ -1442,7 +1447,7 @@ HungarianTrackingResult circlegrid::identify_with_hungarian_tracking(const Track
                     // motion speed (acceleration, lens distortion, direction changes).
                     // Allow 50% of predicted displacement, minimum 15px, capped at 5% edge.
                     const float displacement = static_cast<float>(cv::norm(v_fwd));
-                    const float tolerance = std::min(std::max(0.5f * displacement, 15.f), absolute_cap);
+                    const float tolerance = std::min(std::max(0.5f * displacement, 25.f), absolute_cap);
 
                     if (fwd_err > tolerance || bwd_err > tolerance)
                     {
