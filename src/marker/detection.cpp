@@ -1565,10 +1565,84 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
 
                 if (h2_recovered > 0)
                 {
+                    // Board→image iterative outlier removal: catch edge markers where
+                    // the FCG pixel→pixel H extrapolates poorly (fish-eye distortion).
+                    // Uses iterative worst-outlier removal (remove marker with reproj > 3×median
+                    // AND > 2×P90), which adapts to the actual distribution. Correct edge markers
+                    // with 10-15px reproj (fish-eye) are kept; wrong markers at 30-70px are removed.
+                    const int total_m_h2v = board.rows_ * board.cols_;
+                    int h2_board_removed = 0;
+                    {
+                        // Iterative: compute H, find worst, remove if outlier, repeat
+                        for (int h2v_iter = 0; h2v_iter < 30; ++h2v_iter)
+                        {
+                            std::vector<cv::Point2f> h2v_brd, h2v_img;
+                            std::vector<size_t> h2v_idx;
+                            for (size_t gi = 0; gi < rings.size(); ++gi)
+                            {
+                                if (rings[gi].global_id_ < 0 || rings[gi].global_id_ >= total_m_h2v)
+                                    continue;
+                                const int rr = rings[gi].global_id_ / board.cols_;
+                                const int cc = rings[gi].global_id_ % board.cols_;
+                                const float bx = board.is_asymetric_
+                                    ? static_cast<float>((2 * cc + rr % 2) * board.spacing_)
+                                    : static_cast<float>(cc * board.spacing_);
+                                const float by = static_cast<float>(rr * board.spacing_);
+                                h2v_brd.emplace_back(bx, by);
+                                h2v_img.emplace_back(rings[gi].col_, rings[gi].row_);
+                                h2v_idx.push_back(gi);
+                            }
+                            if (h2v_brd.size() < 8) break;
+
+                            const cv::Mat H_h2v = cv::findHomography(h2v_brd, h2v_img, cv::RANSAC, 5.0);
+                            if (H_h2v.empty()) break;
+
+                            // Compute per-marker reproj errors
+                            std::vector<float> h2v_err(h2v_brd.size());
+                            float worst_err = 0.f;
+                            size_t worst_k = 0;
+                            for (size_t k = 0; k < h2v_brd.size(); ++k)
+                            {
+                                const cv::Mat pt = (cv::Mat_<double>(3, 1)
+                                    << h2v_brd[k].x, h2v_brd[k].y, 1.0);
+                                const cv::Mat proj = H_h2v * pt;
+                                const cv::Point2f projected(
+                                    static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
+                                    static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+                                h2v_err[k] = static_cast<float>(cv::norm(projected - h2v_img[k]));
+                                if (h2v_err[k] > worst_err)
+                                {
+                                    worst_err = h2v_err[k];
+                                    worst_k = k;
+                                }
+                            }
+
+                            // Compute median and P90
+                            std::vector<float> sorted_err = h2v_err;
+                            std::sort(sorted_err.begin(), sorted_err.end());
+                            const float median_e = sorted_err[sorted_err.size() / 2];
+                            const float p90_e = sorted_err[static_cast<size_t>(sorted_err.size() * 0.9)];
+                            const float thresh = std::max(3.f * median_e, 2.f * p90_e);
+
+                            if (worst_err > thresh && h2v_brd.size() > 8)
+                            {
+                                rings[h2v_idx[worst_k]].global_id_ = -1;
+                                ++h2_board_removed;
+                            }
+                            else
+                            {
+                                break;  // converged
+                            }
+                        }
+                    }
+
+                    const int h2_net = h2_recovered - h2_board_removed;
                     spdlog::info("image {}: FCG pixel recovery identified {} additional markers "
-                                 "(vel_rejected={}, row_spacing={:.0f}px)",
-                                 image_idx, h2_recovered, h2_vel_rejected, image_row_spacing);
-                    identification_method += "+fcg_pixel";
+                                 "(vel_rejected={}, board_rejected={}, row_spacing={:.0f}px)",
+                                 image_idx, h2_net, h2_vel_rejected, h2_board_removed,
+                                 image_row_spacing);
+                    if (h2_net > 0)
+                        identification_method += "+fcg_pixel";
                 }
                 fcg_early_recovery_done = true;
             }
