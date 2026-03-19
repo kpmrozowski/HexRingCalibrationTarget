@@ -1621,9 +1621,10 @@ void circlegrid::identify_unmatched_by_local_homography(std::vector<base::Marker
     const float bh = static_cast<float>((board.rows_ - 1) * board.spacing_);
     const float board_aspect = std::max(bw, bh) / std::max(1.f, std::min(bw, bh));
     const int total_markers = board.rows_ * board.cols_;
-    // Near-square: 40% of total. Non-square: fixed 8.
+    // Near-square: 25% of total (seed validation catches bad IDs via RANSAC reproj).
+    // Non-square: fixed 8.
     const int min_seeds = board_aspect < 1.3f
-        ? std::max(8, static_cast<int>(total_markers * 0.4f))
+        ? std::max(8, static_cast<int>(total_markers * 0.25f))
         : 8;
     if (static_cast<int>(board_pts.size()) < min_seeds)
     {

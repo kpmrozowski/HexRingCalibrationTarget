@@ -804,11 +804,22 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
         spdlog::info("image {}: Using Hungarian tracking (primary_id={}, markers={}/{})", image_idx, primary_identified,
                       coding_markers.size(), total_expected_markers);
 
-        // ORB motion field disabled — causing bt0 regression. Need to investigate.
         auto tracking_result = identification::circlegrid::identify_with_hungarian_tracking(
             tracker_state, coding_markers, board, 80.0f, 5.0f, nullptr);
 
-        if (tracking_result.matched_count > primary_identified)
+        // Detect tracker divergence: if Hungarian identifies very few markers
+        // relative to detected blobs AND with high cost, the tracking state is
+        // corrupted. Clear it so subsequent frames start fresh.
+        const float identified_ratio = static_cast<float>(tracking_result.matched_count)
+            / std::max(1.f, static_cast<float>(coding_markers.size()));
+        if (tracking_result.matched_count <= primary_identified && identified_ratio < 0.25f)
+        {
+            spdlog::warn("image {}: tracker diverged (matched={}, ratio={:.2f}, avg_cost={:.1f}), resetting state",
+                          image_idx, tracking_result.matched_count, identified_ratio, tracking_result.avg_cost);
+            tracker_state.clear();
+            // Use whatever primary identification we have (even if poor)
+        }
+        else if (tracking_result.matched_count > primary_identified)
         {
             // Resolve 180-degree ambiguity
             tracking_result.global_ids = identification::circlegrid::resolve_180_ambiguity(
@@ -983,6 +994,101 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
             else
             {
                 identification_method += "+homography";
+            }
+        }
+    }
+
+    // FCG-reference fallback: if we still have many unidentified blobs and have a
+    // previous findCirclesGrid reference, compute homography from FCG positions to
+    // current frame and match unidentified blobs directly.
+    {
+        const int current_identified = static_cast<int>(
+            std::count_if(rings.begin(), rings.end(), [](const auto& r) { return r.global_id_ >= 0; }));
+        const int current_unidentified = static_cast<int>(rings.size()) - current_identified;
+        const int total_markers = board.rows_ * board.cols_;
+        const bool need_fcg_fallback = current_identified < total_markers / 2
+            && current_unidentified > 0
+            && !tracker_state.last_fcg_positions_.empty()
+            && static_cast<int>(tracker_state.last_fcg_positions_.size()) == total_markers;
+
+        if (need_fcg_fallback)
+        {
+            // Use currently identified markers to compute homography from FCG reference to current
+            std::vector<cv::Point2f> src_pts, dst_pts;
+            for (const auto& ring : rings)
+            {
+                if (ring.global_id_ < 0 || ring.global_id_ >= total_markers) continue;
+                const auto& ref_pos = tracker_state.last_fcg_positions_[ring.global_id_];
+                if (ref_pos.x == 0.f && ref_pos.y == 0.f) continue;
+                src_pts.push_back(ref_pos);
+                dst_pts.emplace_back(ring.col_, ring.row_);
+            }
+
+            if (static_cast<int>(src_pts.size()) >= 4)
+            {
+                const cv::Mat H_fcg = cv::findHomography(src_pts, dst_pts, cv::RANSAC, 10.0);
+                if (!H_fcg.empty())
+                {
+                    std::set<int> used_gids;
+                    for (const auto& r : rings)
+                        if (r.global_id_ >= 0) used_gids.insert(r.global_id_);
+
+                    // Compute mean spacing for threshold
+                    float mean_sp = 0.f;
+                    int sp_count = 0;
+                    for (size_t a = 1; a < dst_pts.size(); ++a)
+                        for (size_t b = 0; b < a; ++b)
+                        {
+                            const float d = static_cast<float>(cv::norm(dst_pts[a] - dst_pts[b]));
+                            if (d < 200.f) { mean_sp += d; ++sp_count; }
+                        }
+                    mean_sp = sp_count > 0 ? mean_sp / static_cast<float>(sp_count) : 50.f;
+
+                    int fcg_identified = 0;
+                    for (auto& ring : rings)
+                    {
+                        if (ring.global_id_ >= 0) continue;
+                        const cv::Point2f img_pos(ring.col_, ring.row_);
+
+                        // Tighter threshold than local homography (20% vs 30%) since
+                        // the FCG reference may be from a distant frame
+                        float best_dist = mean_sp * 0.2f;
+                        int best_gid = -1;
+                        for (int gid = 0; gid < total_markers; ++gid)
+                        {
+                            if (used_gids.count(gid)) continue;
+                            const auto& ref_pos = tracker_state.last_fcg_positions_[gid];
+                            if (ref_pos.x == 0.f && ref_pos.y == 0.f) continue;
+
+                            const cv::Mat pt = (cv::Mat_<double>(3,1) << ref_pos.x, ref_pos.y, 1.0);
+                            const cv::Mat proj = H_fcg * pt;
+                            const cv::Point2f projected(
+                                static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
+                                static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+                            const float dist = static_cast<float>(cv::norm(img_pos - projected));
+                            if (dist < best_dist)
+                            {
+                                best_dist = dist;
+                                best_gid = gid;
+                            }
+                        }
+                        if (best_gid >= 0)
+                        {
+                            ring.global_id_ = best_gid;
+                            used_gids.insert(best_gid);
+                            ++fcg_identified;
+                        }
+                    }
+                    if (fcg_identified > 0)
+                    {
+                        spdlog::info("image {}: FCG-reference fallback identified {} additional markers",
+                                      image_idx, fcg_identified);
+                        if (identification_method == "none")
+                            identification_method = "fcg_reference";
+                        else
+                            identification_method += "+fcg_reference";
+                    }
+                }
             }
         }
     }
@@ -1314,24 +1420,32 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
                     homography_reproj_error[ring_indices_q[j]] = reproj_errors[j];
                 }
 
-                // Compute median for outlier threshold
+                // Compute median and P90 for outlier threshold
                 std::vector<float> sorted_reproj = reproj_errors;
                 std::sort(sorted_reproj.begin(), sorted_reproj.end());
                 const float median_reproj = sorted_reproj[sorted_reproj.size() / 2];
-                // Outlier threshold: 3× median, minimum 10px (accounts for lens distortion)
-                const float outlier_thresh = std::max(3.f * median_reproj, 10.f);
+                const float p90_reproj = sorted_reproj[static_cast<size_t>(sorted_reproj.size() * 0.9)];
+                // Adaptive threshold: use max(3×median, p90×2) to adapt to the dataset's
+                // intrinsic reproj level (high for wide-angle, low for normal lens).
+                // This avoids a fixed minimum that's too loose for bt and too tight for n1c.
+                const float outlier_thresh = std::max(3.f * median_reproj, 2.f * p90_reproj);
 
-                // Remove gross outliers (clear misidentifications) — iterative
+                // Remove gross outliers — but ONLY if method is NOT findCirclesGrid.
+                // FCG markers are reliably identified; their high reproj is from lens
+                // distortion (homography can't model equidistant distortion at edges).
                 int outliers_removed = 0;
-                for (size_t j = 0; j < board_pts_q.size(); ++j)
+                if (identification_method != "findCirclesGrid")
                 {
-                    if (reproj_errors[j] > outlier_thresh)
+                    for (size_t j = 0; j < board_pts_q.size(); ++j)
                     {
-                        spdlog::debug("image {}: reproj outlier: gid {} reproj={:.1f}px > {:.1f}px, unsetting",
-                                       image_idx, rings[ring_indices_q[j]].global_id_,
-                                       reproj_errors[j], outlier_thresh);
-                        rings[ring_indices_q[j]].global_id_ = -1;
-                        ++outliers_removed;
+                        if (reproj_errors[j] > outlier_thresh)
+                        {
+                            spdlog::debug("image {}: reproj outlier: gid {} reproj={:.1f}px > {:.1f}px, unsetting",
+                                           image_idx, rings[ring_indices_q[j]].global_id_,
+                                           reproj_errors[j], outlier_thresh);
+                            rings[ring_indices_q[j]].global_id_ = -1;
+                            ++outliers_removed;
+                        }
                     }
                 }
 
