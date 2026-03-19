@@ -2482,6 +2482,8 @@ bool circlegrid::test_find_circles_grid(std::vector<int>& indices,
         // Costs are similar (near-square grid): compare against a LOCKED reference.
         // Use the previous findCirclesGrid frame's centers for comparison.
         // Also maintain an immutable first-frame reference for robustness across restarts.
+        // Note: if the board physically rotates ~180° during the sequence, use
+        // --image-rotation ROTATE_90_COUNTERCLOCKWISE to make the grid non-square.
         auto& prev_centers = tracker_state.prev_findcircles_centers_;
 
         // Immutable reference: set once, never updated. Survives optimizer restarts

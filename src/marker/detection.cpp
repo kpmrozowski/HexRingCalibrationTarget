@@ -1790,61 +1790,89 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
 
         if (board_pts_q.size() >= 8)
         {
-            const cv::Mat H_q = cv::findHomography(board_pts_q, image_pts_q, cv::RANSAC, 5.0);
+            cv::Mat H_q = cv::findHomography(board_pts_q, image_pts_q, cv::RANSAC, 5.0);
             if (!H_q.empty())
             {
-                // Compute per-marker reproj error
-                std::vector<float> reproj_errors(board_pts_q.size());
-                for (size_t j = 0; j < board_pts_q.size(); ++j)
-                {
-                    const cv::Mat pt = (cv::Mat_<double>(3,1) << board_pts_q[j].x, board_pts_q[j].y, 1.0);
-                    const cv::Mat proj = H_q * pt;
-                    const cv::Point2f projected(static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
-                                                 static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
-                    reproj_errors[j] = static_cast<float>(cv::norm(projected - image_pts_q[j]));
-                    homography_reproj_error[ring_indices_q[j]] = reproj_errors[j];
-                }
-
-                // Compute median and P90 for outlier threshold
-                std::vector<float> sorted_reproj = reproj_errors;
-                std::sort(sorted_reproj.begin(), sorted_reproj.end());
-                const float median_reproj = sorted_reproj[sorted_reproj.size() / 2];
-                const float p90_reproj = sorted_reproj[static_cast<size_t>(sorted_reproj.size() * 0.9)];
-                // Adaptive threshold: use max(3×median, p90×2) to adapt to the dataset's
-                // intrinsic reproj level (high for wide-angle, low for normal lens).
-                // This avoids a fixed minimum that's too loose for bt and too tight for n1c.
-                const float outlier_thresh = std::max(3.f * median_reproj, 2.f * p90_reproj);
-
-                // Remove gross outliers — but ONLY if method is NOT findCirclesGrid.
-                // FCG markers are reliably identified; their high reproj is from lens
-                // distortion (homography can't model equidistant distortion at edges).
+                // Iterative self-correcting outlier removal:
+                // 1. Compute per-marker reproj against RANSAC H
+                // 2. Find the worst outlier (> 3×median and > 2×P90)
+                // 3. Remove it and recompute H
+                // 4. Repeat until stable or all markers within threshold
+                // This converges because removing one bad marker improves H for all others.
                 int outliers_removed = 0;
-                const int pre_outlier_count = static_cast<int>(board_pts_q.size());
-                if (identification_method != "findCirclesGrid")
+                const bool allow_removal = (identification_method != "findCirclesGrid");
+
+                for (int iter = 0; iter < 10 && allow_removal; ++iter)
                 {
-                    for (size_t j = 0; j < board_pts_q.size(); ++j)
+                    // Count current identified markers
+                    int current_count = 0;
+                    for (size_t j = 0; j < ring_indices_q.size(); ++j)
+                        if (rings[ring_indices_q[j]].global_id_ >= 0) ++current_count;
+                    if (current_count <= 8) break;
+
+                    // Recompute H from current inliers
+                    std::vector<cv::Point2f> curr_board, curr_image;
+                    std::vector<size_t> curr_idx;
+                    for (size_t j = 0; j < ring_indices_q.size(); ++j)
                     {
-                        // Don't remove if it would drop below 8 identified markers
-                        if (pre_outlier_count - outliers_removed <= 8) break;
-                        if (reproj_errors[j] > outlier_thresh)
-                        {
-                            spdlog::debug("image {}: reproj outlier: gid {} reproj={:.1f}px > {:.1f}px, unsetting",
-                                           image_idx, rings[ring_indices_q[j]].global_id_,
-                                           reproj_errors[j], outlier_thresh);
-                            rings[ring_indices_q[j]].global_id_ = -1;
-                            ++outliers_removed;
-                        }
+                        if (rings[ring_indices_q[j]].global_id_ < 0) continue;
+                        curr_board.push_back(board_pts_q[j]);
+                        curr_image.push_back(image_pts_q[j]);
+                        curr_idx.push_back(j);
+                    }
+                    if (curr_board.size() < 8) break;
+
+                    H_q = cv::findHomography(curr_board, curr_image, cv::RANSAC, 5.0);
+                    if (H_q.empty()) break;
+
+                    // Compute reproj errors
+                    float worst_err = 0.f;
+                    size_t worst_idx = 0;
+                    std::vector<float> errors(curr_board.size());
+                    for (size_t k = 0; k < curr_board.size(); ++k)
+                    {
+                        const cv::Mat pt = (cv::Mat_<double>(3,1) << curr_board[k].x, curr_board[k].y, 1.0);
+                        const cv::Mat proj = H_q * pt;
+                        const cv::Point2f projected(static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
+                                                     static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+                        errors[k] = static_cast<float>(cv::norm(projected - curr_image[k]));
+                        homography_reproj_error[ring_indices_q[curr_idx[k]]] = errors[k];
+                        if (errors[k] > worst_err) { worst_err = errors[k]; worst_idx = k; }
+                    }
+
+                    // Compute median
+                    std::vector<float> sorted_e = errors;
+                    std::sort(sorted_e.begin(), sorted_e.end());
+                    const float median_e = sorted_e[sorted_e.size() / 2];
+                    const float p90_e = sorted_e[static_cast<size_t>(sorted_e.size() * 0.9)];
+                    const float thresh = std::max(3.f * median_e, 2.f * p90_e);
+
+                    // Remove worst outlier if it exceeds threshold
+                    if (worst_err > thresh && current_count > 8)
+                    {
+                        const size_t orig_j = curr_idx[worst_idx];
+                        spdlog::debug("image {}: iter {} reproj outlier: gid {} reproj={:.1f}px > {:.1f}px (median={:.1f})",
+                                       image_idx, iter, rings[ring_indices_q[orig_j]].global_id_,
+                                       worst_err, thresh, median_e);
+                        rings[ring_indices_q[orig_j]].global_id_ = -1;
+                        ++outliers_removed;
+                    }
+                    else
+                    {
+                        break;  // All within threshold — converged
                     }
                 }
 
-                // Recompute frame stats after outlier removal
+                // Compute final frame stats
                 float sum_err = 0.f, max_err = 0.f;
                 int valid_count = 0;
-                for (size_t j = 0; j < board_pts_q.size(); ++j)
+                for (size_t j = 0; j < ring_indices_q.size(); ++j)
                 {
                     if (rings[ring_indices_q[j]].global_id_ < 0) continue;
-                    sum_err += reproj_errors[j];
-                    max_err = std::max(max_err, reproj_errors[j]);
+                    const auto it = homography_reproj_error.find(ring_indices_q[j]);
+                    const float e = it != homography_reproj_error.end() ? it->second : 0.f;
+                    sum_err += e;
+                    max_err = std::max(max_err, e);
                     ++valid_count;
                 }
                 frame_reproj_mean = valid_count > 0 ? sum_err / static_cast<float>(valid_count) : -1.f;
@@ -1852,10 +1880,46 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
 
                 if (outliers_removed > 0)
                 {
-                    spdlog::info("image {}: removed {} reproj outliers (median={:.1f}px, thresh={:.1f}px), "
+                    spdlog::info("image {}: removed {} reproj outliers (iterative), "
                                  "remaining: mean={:.2f}px max={:.2f}px ({} markers)",
-                                 image_idx, outliers_removed, median_reproj, outlier_thresh,
+                                 image_idx, outliers_removed,
                                  frame_reproj_mean, frame_reproj_max, valid_count);
+                }
+
+                // Aggressive cleanup: if reproj is still very high after iterative removal,
+                // keep only RANSAC inlier markers (those consistent with the homography).
+                // This prevents misidentified markers from corrupting the IMU-cam calibration.
+                if (frame_reproj_mean > 20.f && valid_count > 8 && allow_removal)
+                {
+                    // Recompute H one more time and keep only tight inliers
+                    std::vector<cv::Point2f> final_board, final_image;
+                    std::vector<size_t> final_idx;
+                    for (size_t j = 0; j < ring_indices_q.size(); ++j)
+                    {
+                        if (rings[ring_indices_q[j]].global_id_ < 0) continue;
+                        final_board.push_back(board_pts_q[j]);
+                        final_image.push_back(image_pts_q[j]);
+                        final_idx.push_back(j);
+                    }
+                    if (final_board.size() >= 8)
+                    {
+                        std::vector<uchar> inlier_mask;
+                        cv::findHomography(final_board, final_image, cv::RANSAC, 8.0, inlier_mask);
+                        int aggressive_removed = 0;
+                        int remaining = static_cast<int>(final_board.size());
+                        for (size_t k = 0; k < final_idx.size(); ++k)
+                        {
+                            if (!inlier_mask[k] && remaining > 8)
+                            {
+                                rings[ring_indices_q[final_idx[k]]].global_id_ = -1;
+                                ++aggressive_removed;
+                                --remaining;
+                            }
+                        }
+                        if (aggressive_removed > 0)
+                            spdlog::info("image {}: aggressive RANSAC cleanup removed {} more markers ({} remaining)",
+                                          image_idx, aggressive_removed, remaining);
+                    }
                 }
                 else if (frame_reproj_mean > 5.0f)
                 {
