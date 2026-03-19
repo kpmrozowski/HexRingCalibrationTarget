@@ -2260,10 +2260,15 @@ bool populate_indices(std::vector<int>& indices, const std::vector<base::MarkerC
                       const std::vector<cv::Point2f>& centers)
 {
     indices.clear();
+    // First try exact matching (same brightness scale: positions are identical).
+    // Then fall back to proximity matching (different scale: positions differ slightly).
+    constexpr float kProximityThreshold = 3.0f;  // max pixels for fallback proximity match
+
     for (size_t idx_marker = 0; idx_marker < coding_markers.size(); ++idx_marker)
     {
         bool found = false;
         const base::MarkerCoding& marker = coding_markers[idx_marker];
+        // Exact match first
         for (size_t idx_center = 0; idx_center < centers.size(); ++idx_center)
         {
             const cv::Point2f& center = centers[idx_center];
@@ -2273,11 +2278,22 @@ bool populate_indices(std::vector<int>& indices, const std::vector<base::MarkerC
                 break;
             }
         }
-
+        // Proximity fallback
         if (!found)
         {
-            indices.push_back(-1);
-            spdlog::warn("Center id {} ({:0.1f}, {:0.1f}) was not identified!", idx_marker, marker.col_, marker.row_);
+            const cv::Point2f blob_pos(marker.col_, marker.row_);
+            float best_dist = kProximityThreshold;
+            int best_center = -1;
+            for (size_t idx_center = 0; idx_center < centers.size(); ++idx_center)
+            {
+                const float dist = static_cast<float>(cv::norm(blob_pos - centers[idx_center]));
+                if (dist < best_dist)
+                {
+                    best_dist = dist;
+                    best_center = static_cast<int>(idx_center);
+                }
+            }
+            indices.push_back(best_center);
         }
     }
 
@@ -2506,9 +2522,68 @@ bool circlegrid::test_find_circles_grid(std::vector<int>& indices,
         }
     }
 
-    spdlog::debug("test_find_circles_grid: orientation={}", best_orientation == 0 ? "IDENTITY" : "FLIP_180");
+    spdlog::debug("test_find_circles_grid: reference-based orientation={}", best_orientation == 0 ? "IDENTITY" : "FLIP_180");
 
-    // Apply the best orientation
+    // For ambiguous grids: try BOTH orientations and pick the one whose assigned IDs
+    // are most consistent with existing tracking history. The correct orientation will
+    // have blobs near their tracked positions; the wrong one will not.
+    if (board_has_180_ambiguity(board) && tracker_state.has_previous_ && !tracker_state.tracks_.empty())
+    {
+        const auto centers_id = apply_orientation(centers, board.rows_, board.cols_, 0);
+        const auto centers_flip = apply_orientation(centers, board.rows_, board.cols_, 1);
+
+        std::vector<int> indices_id, indices_flip;
+        const bool ok_id = populate_indices(indices_id, coding_markers, centers_id);
+        const bool ok_flip = populate_indices(indices_flip, coding_markers, centers_flip);
+
+        // Count how many assigned IDs match existing tracks (blob near track's last_position)
+        auto count_track_matches = [&](const std::vector<int>& ids) -> int {
+            int matches = 0;
+            for (size_t i = 0; i < ids.size(); ++i)
+            {
+                if (ids[i] < 0) continue;
+                auto it = tracker_state.tracks_.find(ids[i]);
+                if (it == tracker_state.tracks_.end()) continue;
+                const float dist = static_cast<float>(cv::norm(
+                    cv::Point2f(coding_markers[i].col_, coding_markers[i].row_) - it->second.last_position));
+                if (dist < 80.f) ++matches;  // within reasonable inter-frame motion
+            }
+            return matches;
+        };
+
+        const int matches_id = ok_id ? count_track_matches(indices_id) : 0;
+        const int matches_flip = ok_flip ? count_track_matches(indices_flip) : 0;
+
+        const int min_decisive = total / 5;  // need ≥20% track matches to trust the comparison
+        if (matches_flip > matches_id && matches_flip >= min_decisive)
+        {
+            spdlog::info("test_find_circles_grid: FLIP_180 matches more tracks ({} vs {}, min={}), overriding",
+                          matches_flip, matches_id, min_decisive);
+            best_orientation = 1;
+            indices = indices_flip;
+            tracker_state.prev_findcircles_centers_ = centers_flip;
+        }
+        else if (matches_id >= matches_flip && matches_id >= min_decisive)
+        {
+            best_orientation = 0;
+            indices = indices_id;
+            tracker_state.prev_findcircles_centers_ = centers_id;
+        }
+        else
+        {
+            // Insufficient track matches — fall back to reference-based orientation
+            spdlog::debug("test_find_circles_grid: insufficient track matches (id={}, flip={}, min={}), using reference",
+                           matches_id, matches_flip, min_decisive);
+            const auto final_centers = apply_orientation(centers, board.rows_, board.cols_, best_orientation);
+            return populate_indices(indices, coding_markers, final_centers);
+        }
+
+        spdlog::debug("test_find_circles_grid: final orientation={} (id_matches={}, flip_matches={})",
+                       best_orientation == 0 ? "IDENTITY" : "FLIP_180", matches_id, matches_flip);
+        return ok_id || ok_flip;
+    }
+
+    // Non-ambiguous grids or no tracking history: use reference-based orientation
     const auto final_centers = apply_orientation(centers, board.rows_, board.cols_, best_orientation);
     return populate_indices(indices, coding_markers, final_centers);
 }

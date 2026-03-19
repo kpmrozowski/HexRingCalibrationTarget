@@ -805,10 +805,10 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
     }
 
     // Count how many markers findCirclesGrid actually identified
-    const int primary_identified = primary_succeeded
-                                       ? static_cast<int>(std::count_if(global_ids.begin(), global_ids.end(),
-                                                                         [](int id) { return id >= 0; }))
-                                       : 0;
+    int primary_identified = primary_succeeded
+                                 ? static_cast<int>(std::count_if(global_ids.begin(), global_ids.end(),
+                                                                   [](int id) { return id >= 0; }))
+                                 : 0;
 
     // Use Hungarian tracking when findCirclesGrid failed or identified less than 50% of markers.
     const bool primary_poor = !primary_succeeded || primary_identified < static_cast<int>(coding_markers.size()) / 2;
@@ -841,6 +841,50 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
                 tracking_result.global_ids, coding_markers, tracker_state, board);
 
             global_ids = tracking_result.global_ids;
+
+            // Early board→image homography validation: catch row-slipped matches
+            // BEFORE they pollute local homography and other downstream steps.
+            // Row-slips have ~30px reproj error against board→image H, while correct
+            // matches have <5px, so RANSAC easily separates them.
+            {
+                const int total_m = board.rows_ * board.cols_;
+                std::vector<cv::Point2f> brd_pts, img_pts;
+                std::vector<size_t> brd_idx;
+                for (size_t gi = 0; gi < global_ids.size(); ++gi)
+                {
+                    if (global_ids[gi] < 0 || global_ids[gi] >= total_m) continue;
+                    const int rr = global_ids[gi] / board.cols_;
+                    const int cc = global_ids[gi] % board.cols_;
+                    const float bx = board.is_asymetric_
+                        ? static_cast<float>((2 * cc + rr % 2) * board.spacing_)
+                        : static_cast<float>(cc * board.spacing_);
+                    const float by = static_cast<float>(rr * board.spacing_);
+                    brd_pts.emplace_back(bx, by);
+                    img_pts.emplace_back(coding_markers[gi].col_, coding_markers[gi].row_);
+                    brd_idx.push_back(gi);
+                }
+                if (brd_pts.size() >= 8)
+                {
+                    std::vector<uchar> h_inlier;
+                    const cv::Mat H_brd = cv::findHomography(brd_pts, img_pts, cv::RANSAC, 8.0, h_inlier);
+                    if (!H_brd.empty())
+                    {
+                        int h_removed = 0;
+                        for (size_t ki = 0; ki < brd_idx.size(); ++ki)
+                        {
+                            if (!h_inlier[ki])
+                            {
+                                global_ids[brd_idx[ki]] = -1;
+                                ++h_removed;
+                            }
+                        }
+                        if (h_removed > 0)
+                            spdlog::info("image {}: Hungarian board→image validation removed {} row-slipped markers",
+                                         image_idx, h_removed);
+                    }
+                }
+            }
+
             const int identified_count =
                 static_cast<int>(std::count_if(global_ids.begin(), global_ids.end(), [](int id) { return id >= 0; }));
             spdlog::info("image {}: Hungarian tracking identified {} markers (avg_cost={:.1f})", image_idx,
@@ -887,8 +931,14 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
         const int total_markers = board.rows_ * board.cols_;
         const bool has_fcg_ref = !tracker_state.last_fcg_positions_.empty()
             && static_cast<int>(tracker_state.last_fcg_positions_.size()) == total_markers;
+        // Skip brute-force when FCG pixel recovery (H2) is available — it does the
+        // same job with tighter threshold (10px vs 33px) and velocity cross-check.
+        const bool has_recent_fcg_bf = has_fcg_ref
+            && tracker_state.last_fcg_frame_ >= 0
+            && (image_idx - tracker_state.last_fcg_frame_) <= 20;
         const bool need_brute_force = current_id_count < std::max(8, total_markers / 3)
-            && static_cast<int>(coding_markers.size()) >= total_markers / 2;
+            && static_cast<int>(coding_markers.size()) >= total_markers / 2
+            && !has_recent_fcg_bf;
 
         if (need_brute_force && has_fcg_ref)
         {
@@ -1366,10 +1416,167 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
     for (size_t i = 0; i < rings.size(); ++i)
         if (rings[i].global_id_ >= 0) pre_homography_identified.insert(i);
 
-    // Always try to identify unmatched markers using local homography
+    // Try to identify unmatched markers.
+    // When a recent FCG reference is available, use FCG pixel→pixel homography
+    // instead of local board→image homography.  The FCG H maps actual lens-distorted
+    // pixel positions directly, avoiding the systematic ~8-15px error at grid edges
+    // that lets board→image H match blobs to wrong rows during fast motion.
     const int unidentified_count =
         static_cast<int>(std::count_if(rings.begin(), rings.end(), [](const auto& r) { return r.global_id_ < 0; }));
-    if (unidentified_count > 0)
+    const int total_markers_h2 = board.rows_ * board.cols_;
+    const bool has_recent_fcg = !tracker_state.last_fcg_positions_.empty()
+        && static_cast<int>(tracker_state.last_fcg_positions_.size()) == total_markers_h2
+        && tracker_state.last_fcg_frame_ >= 0
+        && (image_idx - tracker_state.last_fcg_frame_) <= 20;
+
+    bool fcg_early_recovery_done = false;
+    if (unidentified_count > 0 && has_recent_fcg)
+    {
+        // Build seed: FCG reference → current identified positions
+        std::vector<cv::Point2f> h2_src, h2_dst;
+        for (const auto& ring : rings)
+        {
+            if (ring.global_id_ < 0 || ring.global_id_ >= total_markers_h2) continue;
+            const auto& ref_pos = tracker_state.last_fcg_positions_[ring.global_id_];
+            if (ref_pos.x == 0.f && ref_pos.y == 0.f) continue;
+            h2_src.push_back(ref_pos);
+            h2_dst.emplace_back(ring.col_, ring.row_);
+        }
+
+        if (static_cast<int>(h2_src.size()) >= 8)
+        {
+            const cv::Mat H_h2 = cv::findHomography(h2_src, h2_dst, cv::RANSAC, 5.0);
+            if (!H_h2.empty())
+            {
+                // Compute mean spacing for matching threshold
+                float h2_mean_sp = 0.f;
+                int h2_sp_count = 0;
+                for (size_t a = 1; a < h2_dst.size() && a < 20; ++a)
+                    for (size_t b = 0; b < a; ++b)
+                    {
+                        const float d = static_cast<float>(cv::norm(h2_dst[a] - h2_dst[b]));
+                        if (d < 200.f) { h2_mean_sp += d; ++h2_sp_count; }
+                    }
+                h2_mean_sp = h2_sp_count > 0 ? h2_mean_sp / static_cast<float>(h2_sp_count) : 50.f;
+                const float h2_threshold = h2_mean_sp * 0.2f;
+
+                // Compute structural image-space row spacing for velocity cross-check.
+                // Project board center and point one row above through H_h2.
+                float image_row_spacing = 30.f;  // conservative fallback
+                {
+                    const float cx = static_cast<float>(board.cols_) * board.spacing_;
+                    const float cy = static_cast<float>(board.rows_ / 2) * board.spacing_;
+                    const cv::Mat p1 = (cv::Mat_<double>(3, 1) << cx, cy, 1.0);
+                    const cv::Mat p2 = (cv::Mat_<double>(3, 1) << cx, cy - board.spacing_, 1.0);
+                    // Use FCG ref positions to estimate: project through identity-like mapping
+                    // Actually compute from identified markers: find min distance between
+                    // adjacent-row markers in image space.
+                    std::vector<std::pair<int, cv::Point2f>> id_by_row;  // (row, pos)
+                    for (const auto& ring : rings)
+                    {
+                        if (ring.global_id_ < 0) continue;
+                        id_by_row.emplace_back(ring.global_id_ / board.cols_,
+                                               cv::Point2f(ring.col_, ring.row_));
+                    }
+                    std::sort(id_by_row.begin(), id_by_row.end(),
+                              [](const auto& a, const auto& b) { return a.first < b.first; });
+                    float min_adj_dist = 999.f;
+                    int adj_count = 0;
+                    float adj_sum = 0.f;
+                    for (size_t a = 0; a < id_by_row.size(); ++a)
+                        for (size_t b = a + 1; b < id_by_row.size(); ++b)
+                        {
+                            if (id_by_row[b].first - id_by_row[a].first == 1)
+                            {
+                                const float d = static_cast<float>(
+                                    cv::norm(id_by_row[b].second - id_by_row[a].second));
+                                if (d < 100.f) { adj_sum += d; ++adj_count; }
+                            }
+                            if (id_by_row[b].first > id_by_row[a].first + 1) break;
+                        }
+                    if (adj_count > 0)
+                        image_row_spacing = adj_sum / static_cast<float>(adj_count);
+                }
+
+                std::set<int> h2_used_gids;
+                for (const auto& r : rings)
+                    if (r.global_id_ >= 0) h2_used_gids.insert(r.global_id_);
+
+                int h2_recovered = 0;
+                int h2_vel_rejected = 0;
+                const int pre_count = static_cast<int>(rings.size()) - unidentified_count;
+                for (size_t i = 0; i < rings.size(); ++i)
+                {
+                    if (rings[i].global_id_ >= 0) continue;
+                    const cv::Point2f img_pos(rings[i].col_, rings[i].row_);
+
+                    float best_dist = h2_threshold;
+                    int best_gid = -1;
+                    for (int gid = 0; gid < total_markers_h2; ++gid)
+                    {
+                        if (h2_used_gids.count(gid)) continue;
+                        const auto& ref_pos = tracker_state.last_fcg_positions_[gid];
+                        if (ref_pos.x == 0.f && ref_pos.y == 0.f) continue;
+
+                        const cv::Mat pt = (cv::Mat_<double>(3, 1) << ref_pos.x, ref_pos.y, 1.0);
+                        const cv::Mat proj = H_h2 * pt;
+                        const cv::Point2f projected(
+                            static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
+                            static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+                        const float dist = static_cast<float>(cv::norm(img_pos - projected));
+                        if (dist < best_dist)
+                        {
+                            best_dist = dist;
+                            best_gid = gid;
+                        }
+                    }
+                    if (best_gid < 0) continue;
+
+                    // H3: Velocity-field cross-check.
+                    // Structural bound: half the image row spacing separates correct (~5-10px)
+                    // from row-slipped (~30px) assignments.
+                    bool vel_ok = true;
+                    if (tracker_state.forward_blob_field_.valid)
+                    {
+                        auto track_it = tracker_state.tracks_.find(best_gid);
+                        if (track_it != tracker_state.tracks_.end()
+                            && track_it->second.history_count >= 1)
+                        {
+                            const cv::Point2f prev_pos = track_it->second.last_position;
+                            const cv::Point2f v = tracker_state.forward_blob_field_.transport_predict(prev_pos);
+                            const cv::Point2f predicted = prev_pos + v;
+                            const float vel_err = static_cast<float>(cv::norm(predicted - img_pos));
+                            vel_ok = (vel_err < image_row_spacing * 0.5f);
+                        }
+                        // No track for this gid → accept (no velocity data to cross-check)
+                    }
+
+                    if (vel_ok)
+                    {
+                        rings[i].global_id_ = best_gid;
+                        h2_used_gids.insert(best_gid);
+                        ++h2_recovered;
+                    }
+                    else
+                    {
+                        ++h2_vel_rejected;
+                    }
+                }
+
+                if (h2_recovered > 0)
+                {
+                    spdlog::info("image {}: FCG pixel recovery identified {} additional markers "
+                                 "(vel_rejected={}, row_spacing={:.0f}px)",
+                                 image_idx, h2_recovered, h2_vel_rejected, image_row_spacing);
+                    identification_method += "+fcg_pixel";
+                }
+                fcg_early_recovery_done = true;
+            }
+        }
+    }
+
+    // Fall back to local homography when no recent FCG reference
+    if (unidentified_count > 0 && !fcg_early_recovery_done)
     {
         const int pre_count = static_cast<int>(rings.size()) - unidentified_count;
         identification::circlegrid::identify_unmatched_by_local_homography(rings, board);
@@ -1380,13 +1587,9 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
             spdlog::info("image {}: Local homography identified {} additional markers", image_idx,
                           post_count - pre_count);
             if (identification_method == "none")
-            {
                 identification_method = "homography";
-            }
             else
-            {
                 identification_method += "+homography";
-            }
         }
     }
 
@@ -1939,6 +2142,261 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
                 {
                     spdlog::warn("image {}: HIGH homography reprojection error: mean={:.2f}px max={:.2f}px "
                                  "({} markers)", image_idx, frame_reproj_mean, frame_reproj_max, valid_count);
+                }
+            }
+        }
+    }
+
+    // === Post-cleanup FCG-reference recovery ===
+    // After aggressive RANSAC removed wrong markers, the surviving clean markers
+    // are guaranteed correct.  Use them + the last FCG reference to recover the
+    // dropped markers via homography projection.
+    {
+        const int post_cleanup_count = static_cast<int>(
+            std::count_if(rings.begin(), rings.end(), [](const auto& r) { return r.global_id_ >= 0; }));
+        const int total_markers_rec = board.rows_ * board.cols_;
+        const int detected_blobs = static_cast<int>(rings.size());
+        const bool has_fcg_ref = !tracker_state.last_fcg_positions_.empty()
+            && static_cast<int>(tracker_state.last_fcg_positions_.size()) == total_markers_rec;
+
+        // Trigger when we have enough clean seeds, a significant gap to fill,
+        // and an FCG reference to project from.
+        const bool need_recovery = has_fcg_ref
+            && post_cleanup_count >= 8
+            && post_cleanup_count < detected_blobs * 3 / 4
+            && (detected_blobs - post_cleanup_count) >= 4;
+
+        if (need_recovery)
+        {
+            // Build seed pairs: FCG reference → current clean positions
+            std::vector<cv::Point2f> rec_src, rec_dst;
+            for (const auto& ring : rings)
+            {
+                if (ring.global_id_ < 0 || ring.global_id_ >= total_markers_rec) continue;
+                const auto& ref_pos = tracker_state.last_fcg_positions_[ring.global_id_];
+                if (ref_pos.x == 0.f && ref_pos.y == 0.f) continue;
+                rec_src.push_back(ref_pos);
+                rec_dst.emplace_back(ring.col_, ring.row_);
+            }
+
+            if (static_cast<int>(rec_src.size()) >= 8)
+            {
+                const cv::Mat H_rec = cv::findHomography(rec_src, rec_dst, cv::RANSAC, 5.0);
+                if (!H_rec.empty())
+                {
+                    // Compute mean spacing for matching threshold
+                    float rec_mean_sp = 0.f;
+                    int rec_sp_count = 0;
+                    for (size_t a = 1; a < rec_dst.size() && a < 20; ++a)
+                        for (size_t b = 0; b < a; ++b)
+                        {
+                            const float d = static_cast<float>(cv::norm(rec_dst[a] - rec_dst[b]));
+                            if (d < 200.f) { rec_mean_sp += d; ++rec_sp_count; }
+                        }
+                    rec_mean_sp = rec_sp_count > 0 ? rec_mean_sp / static_cast<float>(rec_sp_count) : 50.f;
+                    const float rec_threshold = rec_mean_sp * 0.2f;
+
+                    std::set<int> used_gids;
+                    std::set<size_t> used_blobs;
+                    for (size_t i = 0; i < rings.size(); ++i)
+                        if (rings[i].global_id_ >= 0)
+                        {
+                            used_gids.insert(rings[i].global_id_);
+                            used_blobs.insert(i);
+                        }
+
+                    // Compute board→image homography from ONLY the clean (pre-recovery)
+                    // markers.  This provides an unbiased reference for validating recovered ones.
+                    std::vector<cv::Point2f> clean_board, clean_image;
+                    for (const auto& ring : rings)
+                    {
+                        if (ring.global_id_ < 0 || ring.global_id_ >= total_markers_rec) continue;
+                        const int r = ring.global_id_ / board.cols_;
+                        const int c = ring.global_id_ % board.cols_;
+                        const float bx = board.is_asymetric_
+                            ? static_cast<float>((2 * c + r % 2) * board.spacing_)
+                            : static_cast<float>(c * board.spacing_);
+                        const float by = static_cast<float>(r * board.spacing_);
+                        clean_board.emplace_back(bx, by);
+                        clean_image.emplace_back(ring.col_, ring.row_);
+                    }
+
+                    cv::Mat H_clean;
+                    float clean_median_reproj = 0.f;
+                    if (clean_board.size() >= 8)
+                    {
+                        H_clean = cv::findHomography(clean_board, clean_image, cv::RANSAC, 5.0);
+                        // Compute median reproj of clean markers for threshold baseline
+                        if (!H_clean.empty())
+                        {
+                            std::vector<float> clean_errors;
+                            for (size_t k = 0; k < clean_board.size(); ++k)
+                            {
+                                const cv::Mat pt = (cv::Mat_<double>(3, 1)
+                                    << clean_board[k].x, clean_board[k].y, 1.0);
+                                const cv::Mat proj = H_clean * pt;
+                                const cv::Point2f projected(
+                                    static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
+                                    static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+                                clean_errors.push_back(
+                                    static_cast<float>(cv::norm(projected - clean_image[k])));
+                            }
+                            std::sort(clean_errors.begin(), clean_errors.end());
+                            clean_median_reproj = clean_errors[clean_errors.size() / 2];
+                        }
+                    }
+
+                    // Compute structural image-space row spacing for velocity cross-check
+                    float h4_row_spacing = 30.f;
+                    {
+                        std::vector<std::pair<int, cv::Point2f>> h4_by_row;
+                        for (const auto& ring : rings)
+                        {
+                            if (ring.global_id_ < 0) continue;
+                            h4_by_row.emplace_back(ring.global_id_ / board.cols_,
+                                                   cv::Point2f(ring.col_, ring.row_));
+                        }
+                        std::sort(h4_by_row.begin(), h4_by_row.end(),
+                                  [](const auto& a, const auto& b) { return a.first < b.first; });
+                        float adj_sum = 0.f;
+                        int adj_count = 0;
+                        for (size_t a = 0; a < h4_by_row.size(); ++a)
+                            for (size_t b = a + 1; b < h4_by_row.size(); ++b)
+                            {
+                                if (h4_by_row[b].first - h4_by_row[a].first == 1)
+                                {
+                                    const float d = static_cast<float>(
+                                        cv::norm(h4_by_row[b].second - h4_by_row[a].second));
+                                    if (d < 100.f) { adj_sum += d; ++adj_count; }
+                                }
+                                if (h4_by_row[b].first > h4_by_row[a].first + 1) break;
+                            }
+                        if (adj_count > 0)
+                            h4_row_spacing = adj_sum / static_cast<float>(adj_count);
+                    }
+
+                    // Project all FCG reference positions and match to unidentified blobs
+                    int recovered = 0;
+                    int h4_vel_rejected = 0;
+                    std::vector<size_t> recovered_indices;
+                    for (size_t i = 0; i < rings.size(); ++i)
+                    {
+                        if (rings[i].global_id_ >= 0) continue;
+                        const cv::Point2f img_pos(rings[i].col_, rings[i].row_);
+
+                        float best_dist = rec_threshold;
+                        int best_gid = -1;
+                        for (int gid = 0; gid < total_markers_rec; ++gid)
+                        {
+                            if (used_gids.count(gid)) continue;
+                            const auto& ref_pos = tracker_state.last_fcg_positions_[gid];
+                            if (ref_pos.x == 0.f && ref_pos.y == 0.f) continue;
+
+                            const cv::Mat pt = (cv::Mat_<double>(3, 1) << ref_pos.x, ref_pos.y, 1.0);
+                            const cv::Mat proj = H_rec * pt;
+                            const cv::Point2f projected(
+                                static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
+                                static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+                            const float dist = static_cast<float>(cv::norm(img_pos - projected));
+                            if (dist < best_dist)
+                            {
+                                best_dist = dist;
+                                best_gid = gid;
+                            }
+                        }
+                        if (best_gid < 0) continue;
+
+                        // H3: Velocity-field cross-check (structural bound: half row spacing)
+                        bool vel_ok = true;
+                        if (tracker_state.forward_blob_field_.valid)
+                        {
+                            auto track_it = tracker_state.tracks_.find(best_gid);
+                            if (track_it != tracker_state.tracks_.end()
+                                && track_it->second.history_count >= 1)
+                            {
+                                const cv::Point2f prev_pos = track_it->second.last_position;
+                                const cv::Point2f v =
+                                    tracker_state.forward_blob_field_.transport_predict(prev_pos);
+                                const cv::Point2f predicted = prev_pos + v;
+                                const float vel_err =
+                                    static_cast<float>(cv::norm(predicted - img_pos));
+                                vel_ok = (vel_err < h4_row_spacing * 0.5f);
+                            }
+                        }
+
+                        if (vel_ok)
+                        {
+                            rings[i].global_id_ = best_gid;
+                            used_gids.insert(best_gid);
+                            recovered_indices.push_back(i);
+                            ++recovered;
+                        }
+                        else
+                        {
+                            ++h4_vel_rejected;
+                        }
+                    }
+
+                    // Validate recovered markers against the CLEAN board→image homography.
+                    // Only reject recovered markers, never the pre-existing clean ones.
+                    if (recovered > 0 && !H_clean.empty())
+                    {
+                        // Use generous threshold: the FCG reference may be several frames
+                        // old, and the board→image homography has systematic residuals from
+                        // target non-planarity and lens distortion.  Row-slipped markers will
+                        // have reproj 25-40px, so 15px is a safe cap.
+                        const float val_thresh = std::max(5.f * clean_median_reproj, 15.f);
+                        int val_removed = 0;
+                        for (const size_t idx : recovered_indices)
+                        {
+                            const int gid = rings[idx].global_id_;
+                            const int r = gid / board.cols_;
+                            const int c = gid % board.cols_;
+                            const float bx = board.is_asymetric_
+                                ? static_cast<float>((2 * c + r % 2) * board.spacing_)
+                                : static_cast<float>(c * board.spacing_);
+                            const float by = static_cast<float>(r * board.spacing_);
+
+                            const cv::Mat pt = (cv::Mat_<double>(3, 1) << bx, by, 1.0);
+                            const cv::Mat proj = H_clean * pt;
+                            const cv::Point2f projected(
+                                static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
+                                static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+                            const float reproj = static_cast<float>(
+                                cv::norm(projected - cv::Point2f(rings[idx].col_, rings[idx].row_)));
+
+                            if (reproj > val_thresh)
+                            {
+                                rings[idx].global_id_ = -1;
+                                ++val_removed;
+                            }
+                        }
+                        const int net_recovered = recovered - val_removed;
+                        if (net_recovered > 0)
+                        {
+                            spdlog::info("image {}: post-cleanup FCG recovery: {} markers "
+                                         "recovered ({} matched, {} reproj_rejected, "
+                                         "{} vel_rejected, row_sp={:.0f}px)",
+                                         image_idx, net_recovered, recovered,
+                                         val_removed, h4_vel_rejected, h4_row_spacing);
+                            identification_method += "+fcg_recovery";
+                        }
+                        else if (recovered > 0)
+                        {
+                            spdlog::debug("image {}: post-cleanup FCG recovery: "
+                                          "all {} matched markers failed validation "
+                                          "(clean_median={:.1f}px, thresh={:.1f}px)",
+                                          image_idx, recovered,
+                                          clean_median_reproj, val_thresh);
+                        }
+                    }
+                    else if (recovered > 0)
+                    {
+                        spdlog::info("image {}: post-cleanup FCG recovery: {} markers "
+                                     "recovered (no validation H available)",
+                                     image_idx, recovered);
+                        identification_method += "+fcg_recovery";
+                    }
                 }
             }
         }
