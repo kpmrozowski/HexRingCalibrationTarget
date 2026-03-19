@@ -117,6 +117,7 @@ struct TrackingState
     // Last findCirclesGrid frame's marker positions (trusted reference for swap detection)
     // Indexed by global_id: last_fcg_positions_[gid] = image position
     std::vector<cv::Point2f> last_fcg_positions_;
+    bool fcg_ever_succeeded_ = false;  // true after first findCirclesGrid success
     int last_fcg_frame_ = -1;
 
     // ORB motion field data

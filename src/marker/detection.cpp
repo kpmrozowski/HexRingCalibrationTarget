@@ -778,6 +778,11 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
     // Store findCirclesGrid positions as trusted reference for swap detection
     if (primary_succeeded)
     {
+        if (!tracker_state.fcg_ever_succeeded_)
+        {
+            tracker_state.fcg_ever_succeeded_ = true;
+            spdlog::info("image {}: first findCirclesGrid success — detection enabled", image_idx);
+        }
         const int total = board.rows_ * board.cols_;
         tracker_state.last_fcg_positions_.assign(total, cv::Point2f(-1, -1));
         for (size_t i = 0; i < coding_markers.size() && i < global_ids.size(); ++i)
@@ -788,6 +793,15 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
         }
         tracker_state.last_fcg_frame_ = image_idx;
         spdlog::debug("image {}: stored findCirclesGrid reference positions", image_idx);
+    }
+
+    // Before the first findCirclesGrid success, all detections are unreliable
+    // (no orientation reference, no tracking seed). Return failure for pre-FCG frames.
+    if (!tracker_state.fcg_ever_succeeded_)
+    {
+        spdlog::info("image {}: skipping (no findCirclesGrid success yet)", image_idx);
+        tracker_state.update(coding_markers, std::vector<int>(coding_markers.size(), -1), input);
+        return make_failed_result(input, binarized, inverted_binarization, {});
     }
 
     // Count how many markers findCirclesGrid actually identified
