@@ -1328,8 +1328,13 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
             if (global_ids[i] < 0) continue;
             const int flipped_id = total - 1 - global_ids[i];
 
-            // Find nearest prev-frame marker by position
-            float best_dist = 50.f;
+            // Find nearest prev-frame marker by position.
+            // Scale radius with motion speed so fast-moving boards still find matches.
+            const float motion_mag = tracker_state.forward_blob_field_.valid
+                ? std::sqrt(tracker_state.forward_blob_field_.vCx * tracker_state.forward_blob_field_.vCx
+                          + tracker_state.forward_blob_field_.vCy * tracker_state.forward_blob_field_.vCy)
+                : 0.f;
+            float best_dist = std::max(50.f, 1.5f * motion_mag);
             int best_prev_id = -1;
             for (size_t j = 0; j < tracker_state.prev_markers_.size(); ++j)
             {
@@ -1352,7 +1357,8 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
             }
         }
 
-        if (compared >= 10 && matches_flipped > matches_original * 3)
+        if (compared >= 10 && matches_flipped > matches_original * 3
+            && matches_flipped >= std::max(5, compared / 5))
         {
             spdlog::info("image {}: Hungarian 180° flip (orig={}, flip={}, cmp={}), correcting",
                          image_idx, matches_original, matches_flipped, compared);
@@ -1445,8 +1451,11 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
 
         if (static_cast<int>(h2_src.size()) >= 8)
         {
-            const cv::Mat H_h2 = cv::findHomography(h2_src, h2_dst, cv::RANSAC, 5.0);
-            if (!H_h2.empty())
+            // Affine (6 DOF) instead of homography (8 DOF): better edge extrapolation
+            // for fish-eye cameras where the pixel→pixel mapping is non-projective.
+            cv::Mat h2_affine_inliers;
+            const cv::Mat A_h2 = cv::estimateAffine2D(h2_src, h2_dst, h2_affine_inliers, cv::RANSAC, 5.0);
+            if (!A_h2.empty())
             {
                 // Compute mean spacing for matching threshold
                 float h2_mean_sp = 0.f;
@@ -1518,11 +1527,12 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
                         const auto& ref_pos = tracker_state.last_fcg_positions_[gid];
                         if (ref_pos.x == 0.f && ref_pos.y == 0.f) continue;
 
-                        const cv::Mat pt = (cv::Mat_<double>(3, 1) << ref_pos.x, ref_pos.y, 1.0);
-                        const cv::Mat proj = H_h2 * pt;
-                        const cv::Point2f projected(
-                            static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
-                            static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+                        // Affine projection (2×3 matrix)
+                        const float px = static_cast<float>(
+                            A_h2.at<double>(0, 0) * ref_pos.x + A_h2.at<double>(0, 1) * ref_pos.y + A_h2.at<double>(0, 2));
+                        const float py = static_cast<float>(
+                            A_h2.at<double>(1, 0) * ref_pos.x + A_h2.at<double>(1, 1) * ref_pos.y + A_h2.at<double>(1, 2));
+                        const cv::Point2f projected(px, py);
                         const float dist = static_cast<float>(cv::norm(img_pos - projected));
                         if (dist < best_dist)
                         {
@@ -1675,10 +1685,13 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
             std::count_if(rings.begin(), rings.end(), [](const auto& r) { return r.global_id_ >= 0; }));
         const int current_unidentified = static_cast<int>(rings.size()) - current_identified;
         const int total_markers = board.rows_ * board.cols_;
+        // Gate behind !has_recent_fcg: when H2 FCG pixel recovery is available,
+        // it handles this case with tighter threshold + velocity check + board validation.
         const bool need_fcg_fallback = current_identified < total_markers / 2
             && current_unidentified > 0
             && !tracker_state.last_fcg_positions_.empty()
-            && static_cast<int>(tracker_state.last_fcg_positions_.size()) == total_markers;
+            && static_cast<int>(tracker_state.last_fcg_positions_.size()) == total_markers
+            && !has_recent_fcg;
 
         if (need_fcg_fallback)
         {
@@ -2255,8 +2268,10 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
 
             if (static_cast<int>(rec_src.size()) >= 8)
             {
-                const cv::Mat H_rec = cv::findHomography(rec_src, rec_dst, cv::RANSAC, 5.0);
-                if (!H_rec.empty())
+                // Affine (6 DOF) for fish-eye pixel→pixel mapping
+                cv::Mat rec_affine_inliers;
+                const cv::Mat A_rec = cv::estimateAffine2D(rec_src, rec_dst, rec_affine_inliers, cv::RANSAC, 5.0);
+                if (!A_rec.empty())
                 {
                     // Compute mean spacing for matching threshold
                     float rec_mean_sp = 0.f;
@@ -2366,11 +2381,12 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
                             const auto& ref_pos = tracker_state.last_fcg_positions_[gid];
                             if (ref_pos.x == 0.f && ref_pos.y == 0.f) continue;
 
-                            const cv::Mat pt = (cv::Mat_<double>(3, 1) << ref_pos.x, ref_pos.y, 1.0);
-                            const cv::Mat proj = H_rec * pt;
-                            const cv::Point2f projected(
-                                static_cast<float>(proj.at<double>(0) / proj.at<double>(2)),
-                                static_cast<float>(proj.at<double>(1) / proj.at<double>(2)));
+                            // Affine projection (2×3 matrix)
+                            const float px = static_cast<float>(
+                                A_rec.at<double>(0, 0) * ref_pos.x + A_rec.at<double>(0, 1) * ref_pos.y + A_rec.at<double>(0, 2));
+                            const float py = static_cast<float>(
+                                A_rec.at<double>(1, 0) * ref_pos.x + A_rec.at<double>(1, 1) * ref_pos.y + A_rec.at<double>(1, 2));
+                            const cv::Point2f projected(px, py);
                             const float dist = static_cast<float>(cv::norm(img_pos - projected));
                             if (dist < best_dist)
                             {
