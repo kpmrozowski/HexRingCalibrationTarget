@@ -608,11 +608,11 @@ std::optional<base::ImageDecoding> detection::detect_and_identify(cv::Mat1b &inp
                                marker_area, calibrated_area);
 }
 
-base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, const DetectionParameters &parameters,
-                                                              const BoardCircleGrid &board,
-                                                              identification::circlegrid::TrackingState &tracker_state,
-                                                              const int image_idx,
-                                                              const std::filesystem::path &output_path)
+base::ImageDecoding detection::detect_and_identify_circlegrid(
+    cv::Mat1b &input, const DetectionParameters &parameters, const BoardCircleGrid &board,
+    identification::circlegrid::TrackingState &tracker_state, const int image_idx,
+    const std::filesystem::path &output_path,
+    const std::optional<std::vector<base::MarkerCoding>> &prebuilt_coding_markers)
 {
     spdlog::info("Detecting circle grid markers in image {}", image_idx);
 
@@ -648,9 +648,36 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
     bool best_find_circles_grid_succeeded = false;
     size_t best_marker_count = 0;
 
-    for (size_t brightness_scale_idx = 0; brightness_scale_idx < parameters.brightness_scales_.size();
-         ++brightness_scale_idx)
+    // Repair-path bypass: when prebuilt coding markers are supplied (by the dropped-frame
+    // repair module), skip the brightness-scale loop and blob detection entirely —
+    // reuse the pass-1 detections and let the identification stages below handle
+    // the rest. See docs/modules/marker/2026-04-20-dropped-frame-repair-design.md.
+    if (prebuilt_coding_markers.has_value())
     {
+        std::vector<base::MarkerCoding> coding_markers_temp = prebuilt_coding_markers.value();
+
+        std::vector<int> indices_temp;
+        const bool find_circles_grid_succeeded =
+            coding_markers_temp.size() >= total_expected_markers &&
+            identification::circlegrid::test_find_circles_grid(indices_temp, coding_markers_temp, board, tracker_state);
+
+        best_coding_markers              = std::move(coding_markers_temp);
+        best_indices                     = indices_temp;
+        best_input                       = input.clone();
+        best_binarized                   = cv::Mat1b::zeros(input.rows, input.cols);
+        best_inverted_binarization       = cv::Mat1b::zeros(input.rows, input.cols);
+        best_brightness_scale            = 1.0f;
+        best_find_circles_grid_succeeded = find_circles_grid_succeeded;
+        best_marker_count                = best_coding_markers.size();
+
+        spdlog::info("image {}: repair path — reused {} prebuilt coding markers, findCirclesGrid: {}", image_idx,
+                     best_coding_markers.size(), find_circles_grid_succeeded ? "PASS" : "FAIL");
+    }
+    else
+    {
+        for (size_t brightness_scale_idx = 0; brightness_scale_idx < parameters.brightness_scales_.size();
+         ++brightness_scale_idx)
+        {
         const float brightness_scale = parameters.brightness_scales_[brightness_scale_idx];
 
         cv::Mat1b input_scaled;
@@ -744,6 +771,7 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(cv::Mat1b &input, 
         {
             break;
         }
+    }
     }
 
     if (best_coding_markers.empty())

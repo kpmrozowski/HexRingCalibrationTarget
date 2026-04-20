@@ -13,6 +13,7 @@ class CalibrateMono : public utils::Subcommand
     std::string camera_id_;
     int board_type_ = 0;
     int start_idx_ = 0;
+    bool repair_disabled_ = false;
 
    public:
     std::string name() const override { return "CalibrateMono"; }
@@ -29,6 +30,8 @@ class CalibrateMono : public utils::Subcommand
             ->check(CLI::ExistingFile);
         add_board(cmd, board_type_);
         cmd.add_option("--start-idx", start_idx_, "First image idx.");
+        cmd.add_flag("--repair-disabled", repair_disabled_,
+                     "Disable dropped-frame-aware detection repair pass (baseline).");
     }
 
     void execute() override;

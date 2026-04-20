@@ -13,6 +13,7 @@ set(LIB_SRCS
     marker/knn.cpp
     marker/detection.cpp
     marker/detection_parameters.cpp
+    marker/repair_dropped_neighbors.cpp
     marker/symmetries.cpp
     marker/thresholds.cpp
     identification/board_circle/identification_circle.cpp

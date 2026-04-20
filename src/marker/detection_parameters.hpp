@@ -29,6 +29,12 @@ struct DetectionParameters
 
     std::array<float, 5> brightness_scales_{1.0f, 1.5f, 0.67f, 0.44f, 0.30};
 
+    // Dropped-frame repair (see docs/modules/marker/2026-04-20-dropped-frame-repair-design.md)
+    bool  repair_dropped_neighbors_ = true;
+    float repair_gap_factor_        = 2.5f;
+    int   repair_max_span_len_      = 20;
+    bool  repair_extend_backward_   = false;
+
     DetectionParameters(const float focal_in_pixel, const float core_dimension, const float ring_dimension,
                         const float min_z, const float max_z);
 };
