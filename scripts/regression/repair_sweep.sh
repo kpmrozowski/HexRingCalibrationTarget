@@ -21,7 +21,7 @@ if [[ ! -f "${COMPOSE}" ]]; then
   exit 1
 fi
 
-: "${KALIBR_IMAGE:=dops-kalibr-dev}"
+: "${KALIBR_IMAGE:=dops-kalibr}"
 export KALIBR_IMAGE
 
 DATASETS_ROOT=/home/kmro/praca/dev/datasets/nav-operations
