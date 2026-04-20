@@ -48,9 +48,11 @@ clear_caches() {
 run_service() {
   local service="$1"
   local rid="$2"
-  local env_extra="$3"
-  echo ">>> ${service} RID=${rid} ${env_extra}"
-  env RID="${rid}" ${env_extra} docker compose -f "${COMPOSE}" run --rm "${service}"
+  local repair_disabled_value="$3"
+  echo ">>> ${service} RID=${rid} KALIBR_REPAIR_DISABLED=${repair_disabled_value}"
+  RID="${rid}" docker compose -f "${COMPOSE}" run --rm \
+    -e "KALIBR_REPAIR_DISABLED=${repair_disabled_value}" \
+    "${service}"
 }
 
 extract_metrics() {
@@ -79,25 +81,28 @@ run_sweep_pair() {
   local datasets_csv="$2"   # comma-separated for metrics extraction
   local mode="$3"
   local rid="$4"
-  local env_extra="$5"
+  local repair_disabled_value="$5"
 
   IFS=',' read -ra ds_array <<< "${datasets_csv}"
   for ds in "${ds_array[@]}"; do
     clear_caches "${ds}"
   done
-  run_service "${service}" "${rid}" "${env_extra}"
+  run_service "${service}" "${rid}" "${repair_disabled_value}"
   for ds in "${ds_array[@]}"; do
     extract_metrics "${ds}" "${mode}" "${rid}"
   done
 }
 
 # imx219 pair: nord4_1 + nord4_2
-run_sweep_pair verify-imx219-circlegrid "imx219_circlegrid_nord4_1,imx219_circlegrid_nord4_2" baseline results_sweep_baseline "KALIBR_REPAIR_DISABLED=1"
-run_sweep_pair verify-imx219-circlegrid "imx219_circlegrid_nord4_1,imx219_circlegrid_nord4_2" repair   results_sweep_repair   "KALIBR_REPAIR_DISABLED=0"
+run_sweep_pair verify-imx219-circlegrid "imx219_circlegrid_nord4_1,imx219_circlegrid_nord4_2" baseline results_sweep_baseline 1
+run_sweep_pair verify-imx219-circlegrid "imx219_circlegrid_nord4_1,imx219_circlegrid_nord4_2" repair   results_sweep_repair   0
 
 # thermal quadruple: eposN_1..eposN_4
-run_sweep_pair verify-thermal "thermal_circlegrid_eposN_1,thermal_circlegrid_eposN_2,thermal_circlegrid_eposN_3,thermal_circlegrid_eposN_4" baseline results_sweep_baseline "KALIBR_REPAIR_DISABLED=1"
-run_sweep_pair verify-thermal "thermal_circlegrid_eposN_1,thermal_circlegrid_eposN_2,thermal_circlegrid_eposN_3,thermal_circlegrid_eposN_4" repair   results_sweep_repair   "KALIBR_REPAIR_DISABLED=0"
+run_sweep_pair verify-thermal "thermal_circlegrid_eposN_1,thermal_circlegrid_eposN_2,thermal_circlegrid_eposN_3,thermal_circlegrid_eposN_4" baseline results_sweep_baseline 1
+run_sweep_pair verify-thermal "thermal_circlegrid_eposN_1,thermal_circlegrid_eposN_2,thermal_circlegrid_eposN_3,thermal_circlegrid_eposN_4" repair   results_sweep_repair   0
 
 echo
 echo "Sweep complete. Summary: ${SUMMARY}"
+
+# Audible notification — user preference (see memory/feedback_notification_sound.md).
+(play /home/kmro/dev/notification.mp3 2>/dev/null || true) &
