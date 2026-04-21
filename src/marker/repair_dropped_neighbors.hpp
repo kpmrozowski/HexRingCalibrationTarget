@@ -37,6 +37,16 @@ struct Span
 // is reachable within repair_max_span_len_. These frames held bad pass-1
 // identifications (Hungarian / H2 after a jump) and must be invalidated
 // before calibration, otherwise the wrong labels corrupt bundle adjustment.
+//
+// end_idx is bounded by the earliest resync point after start_idx:
+//   - the next FCG success, or
+//   - the frame right after the next timestamp gap,
+//   - repair_max_invalidation_span_ only as a trailing-tail safety fallback
+//     when neither boundary is reachable (dataset ends with no further FCG
+//     or gap).
+// Without this, an inter-gap stretch with no FCG in between (eposN_4
+// F251..F404) would only be partially invalidated up to start + 60 and
+// leave a no-man's-land of bad pass-1 IDs behind.
 struct UnrecoverableSpan
 {
     int      start_idx    = -1;   // first bad frame (immediately after the gap)

@@ -81,6 +81,36 @@ uint64_t gap_threshold_ns(const uint64_t median_dt, const float gap_factor)
 {
     return static_cast<uint64_t>(static_cast<double>(median_dt) * static_cast<double>(gap_factor));
 }
+
+// Earliest trusted re-sync point strictly after start_idx: either the next FCG
+// success or the first frame that follows a fresh timestamp gap. -1 if neither
+// exists before end-of-sequence. Used by detect_unrecoverable_spans() so that
+// a gap with no FCG before the next gap invalidates every frame up to that
+// next gap, instead of leaving a no-man's-land of bad pass-1 Hungarian IDs.
+int find_next_stop_boundary(
+    const std::map<int, FrameCacheEntry>& frame_cache,
+    const int start_idx,
+    const uint64_t threshold_ns)
+{
+    const auto start_it = frame_cache.find(start_idx);
+    if (start_it == frame_cache.end())
+    {
+        return -1;
+    }
+    auto prev_it = start_it;
+    for (auto scan = std::next(start_it); scan != frame_cache.end(); ++scan, ++prev_it)
+    {
+        if (scan->second.fcg_succeeded)
+        {
+            return scan->first;
+        }
+        if (is_gap(prev_it->second.ts_ns, scan->second.ts_ns, threshold_ns))
+        {
+            return scan->first;
+        }
+    }
+    return -1;
+}
 }  // namespace
 
 std::vector<Span> detect_drop_affected_spans(
@@ -142,13 +172,21 @@ std::vector<UnrecoverableSpan> detect_unrecoverable_spans(
         {
             continue;  // recoverable; repaired by repair_span
         }
-        // Bound invalidation either by next FCG (to leave trusted frames alone)
-        // or by max_invalidation_span if no FCG is reached.
-        const int far_anchor = find_anchor_after(frame_cache, it->first, max_invalidation_span);
+        // Extend invalidation to the earliest trusted re-sync point after the
+        // gap: either the next FCG or the next timestamp gap. Without an FCG
+        // between two consecutive gaps the whole inter-gap stretch carries
+        // unreliable pass-1 Hungarian IDs and must be discarded — the old
+        // max_invalidation_span cap left that tail alive (e.g. eposN_4
+        // F251→F404 where only F251..F310 got dropped and F311..F404 kept
+        // their bad Hungarian labels). max_invalidation_span is kept only as
+        // a trailing-tail fallback for when neither boundary is reachable
+        // (dataset ends with no further FCG or gap, e.g. eposN_1 F556).
+        const int next_boundary = find_next_stop_boundary(
+            frame_cache, it->first, threshold_ns);
         UnrecoverableSpan span;
         span.start_idx    = it->first;
-        span.end_idx      = (far_anchor >= 0) ? (far_anchor - 1)
-                                              : (it->first + max_invalidation_span - 1);
+        span.end_idx      = (next_boundary >= 0) ? (next_boundary - 1)
+                                                 : (it->first + max_invalidation_span - 1);
         span.dt_at_gap_ns = it->second.ts_ns - prev_it->second.ts_ns;
         spdlog::warn("repair: gap at frame {} (dt={}ms) unrecoverable — invalidating frames [{}..{}]",
                      span.start_idx, span.dt_at_gap_ns / 1'000'000ULL,

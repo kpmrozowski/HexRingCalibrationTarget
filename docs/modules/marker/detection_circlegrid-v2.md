@@ -450,10 +450,12 @@ For each detected gap, the module walks forward from the first post-gap frame an
 | Span type | Condition | Action |
 |-----------|-----------|--------|
 | **Recoverable** | An FCG frame exists within `repair_max_span_len_` (40) frames after the gap | Backward-propagate IDs from that FCG anchor to every frame in `[start_idx, anchor_idx-1]`. |
-| **Unrecoverable** | No FCG within `repair_max_span_len_` but one within `repair_max_invalidation_span_` (60) frames | Drop every frame in `[start_idx, next_fcg - 1]` from calibration. |
-| **Unrecoverable, no anchor anywhere** | No FCG within 60 frames | Drop `[start_idx, start_idx + 60 - 1]`. |
+| **Unrecoverable** | No FCG within `repair_max_span_len_`; a later resync point (next FCG or next gap) exists | Drop every frame in `[start_idx, next_boundary - 1]` from calibration, where `next_boundary` is whichever resync point comes first. |
+| **Unrecoverable, no boundary anywhere** | No FCG and no further gap reachable before end-of-sequence | Drop `[start_idx, start_idx + repair_max_invalidation_span_ - 1]` (safety fallback, default 60). |
 
 Both classifications are always recorded in `repair_report.txt`.
+
+Note: the unrecoverable end-bound deliberately follows the next gap when no FCG sits between two consecutive gaps. On `eposN_4`, the F250→F251 gap has no FCG until F420, but a second gap lands at F404→F405; every frame in `[F251, F404]` is invalidated so their pass-1 Hungarian / Hungarian+homography IDs never reach bundle adjustment. F405 itself remains the start of a separate recoverable span, repaired via the F420 FCG anchor.
 
 ### 13.4 Backward Affine Propagation
 
@@ -519,7 +521,7 @@ Setting `KALIBR_REPAIR_DISABLED=1` flips `repair_dropped_neighbors_` off. Gap de
 | FCG reference recency | 20 frames | Balance between accuracy and coverage |
 | R1 gap factor | 2.5× median Δt | Catches 150 ms+ bagcreater-dedupe gaps without flagging normal jitter |
 | R1 recoverable span | 40 frames | Typical gap-to-next-FCG distance on thermal; rejects very far anchors |
-| R1 invalidation span | 60 frames | Upper bound on bad-frame drop range when no FCG is reachable |
+| R1 invalidation span | 60 frames | Trailing-tail safety fallback on bad-frame drop range when neither next FCG nor next gap is reachable before end-of-sequence; otherwise the drop ends at the earlier resync point |
 | R1 anchor scale `d_nn` | median nearest-neighbour distance across anchor positions | Equal to `s×√2` for the asymmetric-offset grid; scales with zoom / board distance |
 | R1 ICP thresholds | `{1.20, 0.60, 0.30, 0.20} × d_nn` | Coarse-to-fine affine refinement; final step ≤ smallest inter-gid distance |
 | R1 final assignment gate | `0.20 × d_nn` | Below the smallest valid inter-gid image distance, cannot alias onto a neighbour |
