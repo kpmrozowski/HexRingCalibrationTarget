@@ -14,6 +14,7 @@
 - **Brute-force gate**: Skip brute-force blob matching when FCG pixel recovery is available (Section 8.2)
 - **Rotation center sign fix**: Corrected ICR computation in debug visualization
 - **Affine instead of homography** for pixel-to-pixel FCG mapping (fish-eye compatibility)
+- **Dropped-Frame Repair (R1)**: Post-pass backward propagation of FCG identifications across dedupe-induced timestamp gaps, with row-shift aliasing guard and invalidation fallback for unreachable anchors (Section 13)
 
 ## 1. Problem Statement
 
@@ -426,6 +427,83 @@ This two-pass approach ensures that the first pass (H2) adds markers aggressivel
 
 *Unchanged from v1 (Tracking State, Debug Output -- Sections 11-12 of v1).*
 
+## 13. Post-Processing: Dropped-Frame Repair (R1) [NEW]
+
+**Module:** `marker/repair_dropped_neighbors.{hpp,cpp}`
+**Driver:** `CircleGridCalibInterface::finalizeRepair()` (one call per camera, after all frames have been pushed through `computeObservation`)
+
+### 13.1 Motivation
+
+`kalibr_bagcreater` md5-dedupes pixel-identical frames. Thermal captures frequently stream duplicate frames for 100–600 ms when the pipeline stalls or the camera holds a frame; deduping collapses 9 duplicates down to 1 and opens a large timestamp gap inside the bag. Pass-1 detection has no warning of this gap (each `computeObservation` call sees only one frame and a ROS timestamp). Hungarian tracking assumes ~66 ms frame-to-frame motion and falls into the wrong attractor — typically a column-slip or row-slip — on the first post-gap frame. The mis-identification then propagates forward until the next `findCirclesGrid` (FCG) success "snaps" back, producing an apparent camera velocity impulse that corrupts bundle adjustment.
+
+Recovery must happen **after** pass 1 because the only reliable anchor for the gap-adjacent stretch is the next FCG frame on the far side of the bad stretch. Pass-1 Hungarian+H2 have no access to that future frame.
+
+### 13.2 Symptoms of a Gap
+
+- Timestamp delta between two consecutive cached frames exceeds `repair_gap_factor_ × median(Δt)`. Default factor is 2.5, so ≥ 2.5× the nominal frame period is treated as a gap.
+- No geometric information is needed to detect a gap; timestamps are sufficient.
+
+### 13.3 Span Classification
+
+For each detected gap, the module walks forward from the first post-gap frame and classifies the span:
+
+| Span type | Condition | Action |
+|-----------|-----------|--------|
+| **Recoverable** | An FCG frame exists within `repair_max_span_len_` (40) frames after the gap | Backward-propagate IDs from that FCG anchor to every frame in `[start_idx, anchor_idx-1]`. |
+| **Unrecoverable** | No FCG within `repair_max_span_len_` but one within `repair_max_invalidation_span_` (60) frames | Drop every frame in `[start_idx, next_fcg - 1]` from calibration. |
+| **Unrecoverable, no anchor anywhere** | No FCG within 60 frames | Drop `[start_idx, start_idx + 60 - 1]`. |
+
+Both classifications are always recorded in `repair_report.txt`.
+
+### 13.4 Backward Affine Propagation
+
+For a recoverable span the repair iterates **backwards** from `anchor_idx - 1` down to `start_idx`. The anchor frame's per-gid pixel positions `P_anchor` are the ground truth.
+
+At each repair frame `idx`:
+
+1. **Pull blobs**: take `coding_markers` from the per-frame cache (these are the raw blob centers pass 1 already produced — no re-binarization).
+2. **Scale**: compute once per span the anchor's median nearest-neighbour image-space distance `d_nn` (equal to `s × √2` for the asymmetric-offset HexRing). All downstream thresholds are expressed as fractions of `d_nn` so the algorithm adapts to zoom and board distance without tuning.
+3. **ICP refinement**: iterate through thresholds `{1.20, 0.60, 0.30, 0.20} × d_nn`. Each pass:
+   - Predict each anchor gid's pixel position via the current `running_affine`.
+   - For every (anchor_gid, blob) pair under the threshold, add to a candidate list.
+   - Greedy matching in increasing-distance order (conflicts resolved by shortest distance).
+   - `cv::estimateAffinePartial2D` with RANSAC (4-DOF: rotation + uniform scale + translation) on the matched pairs.
+4. **Anti-alias gate**: compare the refined affine's translation against the last *accepted* `running_affine`. Row-shift aliasing sits at `√2 × d_nn ≈ 1.41 × d_nn`; reject if delta > `1.20 × d_nn`. Legitimate handheld motion is ~0.10–0.15 × d_nn per frame, so this cap allows ~8 consecutive missed frames before saturating.
+5. **Final assignment** at a `0.20 × d_nn` gate: greedy gid→blob mapping becomes the repaired identification.
+6. **Publish**: a fresh `ImageDecoding(success=true, …)` replaces `decoded_cache_[idx]`. Empty binary/area mats are fine — no downstream consumer inspects them for repaired frames.
+
+### 13.5 Invalidation Fallback
+
+For unrecoverable spans the module constructs `ImageDecoding(success=false, …)` for every frame in the span and injects it into `decoded_cache_`. `rebuildStoredObservations` then silently drops those frames, so bundle adjustment never sees them. This is strictly better than leaving the bad pass-1 IDs in place, which corrupted the initial focal-length estimate on eposN_4-style datasets (fx blew up to 6428 px vs 780 px baseline).
+
+### 13.6 Integration Points
+
+```
+computeObservation(frame_i) {
+    decoded_cache_[cam][i]  = result;   // ImageDecoding
+    frame_cache_[cam][i]    = { ts, image, coding_markers, fcg_succeeded, marker_positions };
+}
+
+finalizeRepair(cam) {
+    params = buildRepairParameters();   // honours KALIBR_REPAIR_DISABLED=1
+    run_repair_pass(frame_cache[cam], params, board, decoded_cache[cam], debug_dir);
+    rerenderRepairedDebugImages(cam, params);   // overwrite markers-png-final-*/frame_NNNNNN.png
+    rebuildStoredObservations(cam);             // drops invalidated frames
+}
+```
+
+Python `TargetExtractor.finalizeAll()` calls `target.finalizeRepair()` after the forward pass and before `reidentifyAll`.
+
+### 13.7 Debug Artifacts
+
+- `<debug>/repair_report.txt` — median_dt, gap_factor, per-span records including anchor, gap width, repaired or invalidated frame counts.
+- `<debug>/markers-png-final-NNN/frame_NNNNNN.png` — overwritten for repaired frames; the status-line method reads `[affine_repair]`.
+- `kalibr_calibrate_cameras.log` — per-frame `repair_span: frame X repaired …` / `frame X affine translation jumped … — likely row-alias, skipping` / `invalidate_span: frames [A..B] dropped from calibration` lines.
+
+### 13.8 Environment Toggle
+
+Setting `KALIBR_REPAIR_DISABLED=1` flips `repair_dropped_neighbors_` off. Gap detection still logs spans (for the report) but neither repair nor invalidation runs. Used for A/B regression sweeps.
+
 ## Appendix A: Key Thresholds
 
 | Threshold | Value | Rationale |
@@ -439,6 +517,13 @@ This two-pass approach ensures that the first pass (H2) adds markers aggressivel
 | 180° flip min count | max(5, compared/5) | Prevents single-match noise from triggering flip |
 | Brute-force gate | ≤20 frames since FCG | Same recency as H2 |
 | FCG reference recency | 20 frames | Balance between accuracy and coverage |
+| R1 gap factor | 2.5× median Δt | Catches 150 ms+ bagcreater-dedupe gaps without flagging normal jitter |
+| R1 recoverable span | 40 frames | Typical gap-to-next-FCG distance on thermal; rejects very far anchors |
+| R1 invalidation span | 60 frames | Upper bound on bad-frame drop range when no FCG is reachable |
+| R1 anchor scale `d_nn` | median nearest-neighbour distance across anchor positions | Equal to `s×√2` for the asymmetric-offset grid; scales with zoom / board distance |
+| R1 ICP thresholds | `{1.20, 0.60, 0.30, 0.20} × d_nn` | Coarse-to-fine affine refinement; final step ≤ smallest inter-gid distance |
+| R1 final assignment gate | `0.20 × d_nn` | Below the smallest valid inter-gid image distance, cannot alias onto a neighbour |
+| R1 chained translation cap | `1.20 × d_nn` | Row-shift alias sits at `√2 × d_nn ≈ 1.41 × d_nn`; cap separates it from normal motion (~0.15 × d_nn per frame) while allowing ~8 consecutive missed frames |
 | *All v1 thresholds* | *Unchanged* | *See v1 Appendix A* |
 
 ## Appendix B: Design Decisions
@@ -472,3 +557,20 @@ This two-pass approach ensures that the first pass (H2) adds markers aggressivel
 **Rationale**: The v1 fixed 50 px radius failed at high motion speeds (>50 px/f) where no markers from the previous frame were within range. With zero matches in both orientations, a single accidental match triggered the flip. The velocity-aware radius ensures matches are found at any speed. The minimum-count guard is a safety net: even with perfect radius, noise can produce a few spurious matches. Requiring ≥5 (or 20% of compared) ensures the flip decision is statistically significant.
 
 **Evidence**: On n2c F223 (v=63.7 px/f), v1 incorrectly flipped 30 markers. v2 correctly identifies all 47 markers without flipping.
+
+### B.9 Dropped-Frame Repair: Backward Propagation + Invalidation (R1)
+
+**Decision**: Run a post-pass that backward-propagates FCG identifications across dedupe-induced timestamp gaps. Invalidate any bad-frame stretch that cannot reach an FCG anchor within the recoverable window.
+
+**Rationale**: `kalibr_bagcreater` removes pixel-identical duplicates, opening 300–600 ms gaps inside the bag that no per-frame detector can distinguish from normal motion. Hungarian + H2 silently produce column/row-slipped IDs on the first post-gap frame, then the tracker propagates the slip forward until the next FCG "snaps" it back. The apparent 80+ px/frame velocity impulse at the snap point drives the spline fitter to wildly wrong camera states.
+
+Two options were considered:
+
+- *Extend the forward detector*: give the per-frame API access to global timestamp context. Pervasive API changes across downstream packages; rejected.
+- *Post-pass repair*: cache per-frame blobs and identifications; after the last frame, detect gaps in the cached timestamps, find an FCG anchor on the far side, and re-identify the bad stretch backward from that anchor. Localized to a single new module + interface method; chosen.
+
+**Row-shift aliasing**: the asymmetric offset grid's translation symmetry (row 0 ↔ row 2 in x-coords) creates an aliased affine that fits every (gid, blob) pair equally well except for a ~56-113 px image-space shift. Detected via a 60 px cap on chained-affine translation deltas — real per-frame motion stays ≤10 px, alias jumps ≥56 px, wide separation.
+
+**Invalidation** (vs leaving bad pass-1 IDs in place) is strictly better because the initial focal-length estimator is sensitive to even one or two bogus views: on eposN_4 a single column-slipped frame pushed the initial fx to 6428 px (from 780 px baseline) and the outlier filter then rejected every frame.
+
+**Evidence (eposN_1)**: three gaps at F124 (600 ms), F247 (533 ms), F387 (533 ms). All three spans now repair cleanly (22+19+13 frames, match counts 14–34/35). A fourth gap at F556 has no FCG within 40 frames → 60 frames invalidated and dropped from calibration. Resulting focal ≈ 742/747 px, RMSE 0.19 px — matches baseline to within 2 px of focal and slightly improves RMSE.
