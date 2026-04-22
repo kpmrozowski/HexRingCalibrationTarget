@@ -33,20 +33,15 @@ struct Span
     uint64_t dt_at_gap_ns = 0;
 };
 
-// Represents a gap-affected stretch of frames for which no usable FCG anchor
-// is reachable within repair_max_span_len_. These frames held bad pass-1
-// identifications (Hungarian / H2 after a jump) and must be invalidated
-// before calibration, otherwise the wrong labels corrupt bundle adjustment.
+// Represents a gap-affected stretch of frames for which no FCG re-anchor
+// exists before the next timestamp jump (or before end-of-sequence). These
+// frames held bad pass-1 identifications (Hungarian / H2 after a jump) and
+// must be invalidated before calibration, otherwise the wrong labels corrupt
+// bundle adjustment.
 //
-// end_idx is bounded by the earliest resync point after start_idx:
-//   - the next FCG success, or
-//   - the frame right after the next timestamp gap,
-//   - repair_max_invalidation_span_ only as a trailing-tail safety fallback
-//     when neither boundary is reachable (dataset ends with no further FCG
-//     or gap).
-// Without this, an inter-gap stretch with no FCG in between (eposN_4
-// F251..F404) would only be partially invalidated up to start + 60 and
-// leave a no-man's-land of bad pass-1 IDs behind.
+// end_idx is bounded by the next resync point after start_idx:
+//   - the frame right before the next timestamp gap, or
+//   - the last frame in the cache when no further gap exists before EOF.
 struct UnrecoverableSpan
 {
     int      start_idx    = -1;   // first bad frame (immediately after the gap)
@@ -56,18 +51,27 @@ struct UnrecoverableSpan
 
 uint64_t median_dt_ns(const std::map<int, FrameCacheEntry>& frame_cache);
 
+// Spans whose next-boundary scan (unbounded) reaches a FCG success before the
+// next timestamp jump. The FCG becomes the back-propagation anchor for the
+// whole stretch; the anti-alias guard inside repair_span() decides which
+// frames in the span get cured and which remain bad.
 std::vector<Span> detect_drop_affected_spans(
     const std::map<int, FrameCacheEntry>& frame_cache,
-    float gap_factor,
-    int   max_span_len);
+    float gap_factor);
 
+// Spans with no FCG success before the next timestamp jump (or end-of-sequence).
+// No anchor is reachable without crossing a second jump, so every frame in
+// the span is invalidated outright.
 std::vector<UnrecoverableSpan> detect_unrecoverable_spans(
     const std::map<int, FrameCacheEntry>& frame_cache,
-    float gap_factor,
-    int   max_span_len,
-    int   max_invalidation_span);
+    float gap_factor);
 
-void repair_span(
+// Back-propagate IDs from `span.anchor_idx` (an FCG) through frames
+// `[anchor_idx-1 .. start_idx]`, writing repaired `ImageDecoding` entries
+// into `decoded`. Returns the sorted list of frame indices that were cured.
+// Uncured frames keep their pre-repair decoded entries; the caller is
+// expected to invalidate them (they carry untrusted pass-1 Hungarian IDs).
+std::vector<int> repair_span(
     const Span& span,
     const std::map<int, FrameCacheEntry>& frame_cache,
     const DetectionParameters& base_params,
@@ -76,11 +80,13 @@ void repair_span(
     const std::filesystem::path& output_path);
 
 // Mark the frames in the span as failed in `decoded` so they drop out of
-// downstream calibration. Used for gaps whose next FCG anchor is beyond
-// repair_max_span_len_.
+// downstream calibration. Frame indices listed in `skip_cured` are left
+// untouched — the caller uses this to preserve frames already cured by a
+// prior `repair_span` call on an overlapping recoverable span.
 void invalidate_span(
-    const UnrecoverableSpan& span,
-    std::map<int, base::ImageDecoding>& decoded);
+    const UnrecoverableSpan&            span,
+    std::map<int, base::ImageDecoding>& decoded,
+    const std::vector<int>&             skip_cured = {});
 
 void run_repair_pass(
     const std::map<int, FrameCacheEntry>& frame_cache,

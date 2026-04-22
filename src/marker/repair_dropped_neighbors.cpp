@@ -4,6 +4,7 @@
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <unordered_set>
 
 #include <Eigen/Core>
 #include <opencv2/calib3d.hpp>
@@ -42,31 +43,6 @@ uint64_t median_dt_ns(const std::map<int, FrameCacheEntry>& frame_cache)
 
 namespace
 {
-// Find first post-gap FCG anchor within max_span_len of start_idx. Returns -1 if none.
-int find_anchor_after(
-    const std::map<int, FrameCacheEntry>& frame_cache,
-    const int start_idx,
-    const int max_span_len)
-{
-    const auto start_it = frame_cache.find(start_idx);
-    if (start_it == frame_cache.end())
-    {
-        return -1;
-    }
-    for (auto scan = start_it; scan != frame_cache.end(); ++scan)
-    {
-        if (scan->first - start_idx > max_span_len)
-        {
-            return -1;
-        }
-        if (scan->second.fcg_succeeded && scan->first > start_idx)
-        {
-            return scan->first;
-        }
-    }
-    return -1;
-}
-
 // Detect whether a timestamp gap lives between two adjacent cache entries.
 bool is_gap(const uint64_t t_prev, const uint64_t t_curr, const uint64_t threshold_ns)
 {
@@ -82,12 +58,24 @@ uint64_t gap_threshold_ns(const uint64_t median_dt, const float gap_factor)
     return static_cast<uint64_t>(static_cast<double>(median_dt) * static_cast<double>(gap_factor));
 }
 
-// Earliest trusted re-sync point strictly after start_idx: either the next FCG
-// success or the first frame that follows a fresh timestamp gap. -1 if neither
-// exists before end-of-sequence. Used by detect_unrecoverable_spans() so that
-// a gap with no FCG before the next gap invalidates every frame up to that
-// next gap, instead of leaving a no-man's-land of bad pass-1 Hungarian IDs.
-int find_next_stop_boundary(
+// Earliest re-sync point strictly after start_idx, classified as either an
+// FCG success (a trusted back-prop anchor) or a post-gap frame (a jump that
+// breaks the Hungarian chain). The scan is unbounded — the affine-repair
+// anti-alias guard inside repair_span() is the only thing that decides how
+// far back-propagation actually extends.
+struct NextBoundary
+{
+    enum Kind
+    {
+        kFcg,    // next_boundary is an FCG success — usable as back-prop anchor
+        kGap,    // next_boundary is the first frame after a timestamp jump
+        kNone,   // end-of-sequence reached with no further FCG or jump
+    };
+    Kind kind = kNone;
+    int  idx  = -1;   // -1 iff kind == kNone
+};
+
+NextBoundary find_next_boundary(
     const std::map<int, FrameCacheEntry>& frame_cache,
     const int start_idx,
     const uint64_t threshold_ns)
@@ -95,28 +83,27 @@ int find_next_stop_boundary(
     const auto start_it = frame_cache.find(start_idx);
     if (start_it == frame_cache.end())
     {
-        return -1;
+        return {NextBoundary::kNone, -1};
     }
     auto prev_it = start_it;
     for (auto scan = std::next(start_it); scan != frame_cache.end(); ++scan, ++prev_it)
     {
         if (scan->second.fcg_succeeded)
         {
-            return scan->first;
+            return {NextBoundary::kFcg, scan->first};
         }
         if (is_gap(prev_it->second.ts_ns, scan->second.ts_ns, threshold_ns))
         {
-            return scan->first;
+            return {NextBoundary::kGap, scan->first};
         }
     }
-    return -1;
+    return {NextBoundary::kNone, -1};
 }
 }  // namespace
 
 std::vector<Span> detect_drop_affected_spans(
     const std::map<int, FrameCacheEntry>& frame_cache,
-    const float gap_factor,
-    const int   max_span_len)
+    const float gap_factor)
 {
     std::vector<Span> spans;
     const uint64_t median_dt = median_dt_ns(frame_cache);
@@ -133,14 +120,14 @@ std::vector<Span> detect_drop_affected_spans(
         {
             continue;
         }
-        const int anchor_idx = find_anchor_after(frame_cache, it->first, max_span_len);
-        if (anchor_idx < 0)
+        const NextBoundary next = find_next_boundary(frame_cache, it->first, threshold_ns);
+        if (next.kind != NextBoundary::kFcg)
         {
-            continue;  // unrecoverable; handled by detect_unrecoverable_spans
+            continue;  // no FCG reachable before the next jump — handled as unrecoverable
         }
         Span span;
         span.start_idx    = it->first;
-        span.anchor_idx   = anchor_idx;
+        span.anchor_idx   = next.idx;
         span.dt_at_gap_ns = it->second.ts_ns - prev_it->second.ts_ns;
         spans.push_back(span);
     }
@@ -149,9 +136,7 @@ std::vector<Span> detect_drop_affected_spans(
 
 std::vector<UnrecoverableSpan> detect_unrecoverable_spans(
     const std::map<int, FrameCacheEntry>& frame_cache,
-    const float gap_factor,
-    const int   max_span_len,
-    const int   max_invalidation_span)
+    const float gap_factor)
 {
     std::vector<UnrecoverableSpan> spans;
     const uint64_t median_dt = median_dt_ns(frame_cache);
@@ -161,6 +146,8 @@ std::vector<UnrecoverableSpan> detect_unrecoverable_spans(
     }
     const uint64_t threshold_ns = gap_threshold_ns(median_dt, gap_factor);
 
+    const int last_cached_frame = frame_cache.empty() ? -1 : frame_cache.rbegin()->first;
+
     auto prev_it = frame_cache.begin();
     for (auto it = std::next(prev_it); it != frame_cache.end(); ++it, ++prev_it)
     {
@@ -168,28 +155,21 @@ std::vector<UnrecoverableSpan> detect_unrecoverable_spans(
         {
             continue;
         }
-        if (find_anchor_after(frame_cache, it->first, max_span_len) >= 0)
+        const NextBoundary next = find_next_boundary(frame_cache, it->first, threshold_ns);
+        if (next.kind == NextBoundary::kFcg)
         {
-            continue;  // recoverable; repaired by repair_span
+            continue;  // reachable FCG → handled by detect_drop_affected_spans + repair_span
         }
-        // Extend invalidation to the earliest trusted re-sync point after the
-        // gap: either the next FCG or the next timestamp gap. Without an FCG
-        // between two consecutive gaps the whole inter-gap stretch carries
-        // unreliable pass-1 Hungarian IDs and must be discarded — the old
-        // max_invalidation_span cap left that tail alive (e.g. eposN_4
-        // F251→F404 where only F251..F310 got dropped and F311..F404 kept
-        // their bad Hungarian labels). max_invalidation_span is kept only as
-        // a trailing-tail fallback for when neither boundary is reachable
-        // (dataset ends with no further FCG or gap, e.g. eposN_1 F556).
-        const int next_boundary = find_next_stop_boundary(
-            frame_cache, it->first, threshold_ns);
         UnrecoverableSpan span;
         span.start_idx    = it->first;
-        span.end_idx      = (next_boundary >= 0) ? (next_boundary - 1)
-                                                 : (it->first + max_invalidation_span - 1);
+        span.end_idx      = (next.kind == NextBoundary::kGap) ? (next.idx - 1)
+                                                              : last_cached_frame;
         span.dt_at_gap_ns = it->second.ts_ns - prev_it->second.ts_ns;
-        spdlog::warn("repair: gap at frame {} (dt={}ms) unrecoverable — invalidating frames [{}..{}]",
+        spdlog::warn("repair: gap at frame {} (dt={}ms) unrecoverable ({}) — "
+                     "invalidating frames [{}..{}]",
                      span.start_idx, span.dt_at_gap_ns / 1'000'000ULL,
+                     next.kind == NextBoundary::kGap ? "bounded by next jump"
+                                                      : "no further FCG or jump",
                      span.start_idx, span.end_idx);
         spans.push_back(span);
     }
@@ -617,7 +597,7 @@ bool repair_single_frame(
 }
 }  // namespace
 
-void repair_span(
+std::vector<int> repair_span(
     const Span& span,
     const std::map<int, FrameCacheEntry>& frame_cache,
     const DetectionParameters& /*base_params*/,
@@ -625,31 +605,34 @@ void repair_span(
     std::map<int, base::ImageDecoding>& decoded,
     const std::filesystem::path& /*output_path*/)
 {
+    std::vector<int> cured;
     const auto anchor_it = frame_cache.find(span.anchor_idx);
     if (anchor_it == frame_cache.end() || !anchor_it->second.fcg_succeeded)
     {
         spdlog::warn("repair_span: anchor {} missing or not FCG — skipping", span.anchor_idx);
-        return;
+        return cured;
     }
     const AnchorReference anchor = extract_anchor_reference(anchor_it->second);
     if (anchor.gids.size() < 4)
     {
         spdlog::warn("repair_span: anchor {} has only {} identified markers — skipping span",
                      span.anchor_idx, anchor.gids.size());
-        return;
+        return cured;
     }
     if (anchor.median_nn_distance_px <= 0.f)
     {
         spdlog::warn("repair_span: anchor {} has degenerate geometry (d_nn=0) — skipping span",
                      span.anchor_idx);
-        return;
+        return cured;
     }
     const GeometricThresholds thresholds = thresholds_from_scale(anchor.median_nn_distance_px);
     spdlog::info("repair_span: anchor {} d_nn={:.1f}px -> icp[{:.1f},{:.1f},{:.1f},{:.1f}] "
-                 "final_gate={:.1f}px chained_cap={:.1f}px",
+                 "final_gate={:.1f}px chained_cap={:.1f}px span=[{},{}] length={}",
                  span.anchor_idx, anchor.median_nn_distance_px,
                  thresholds.icp_px[0], thresholds.icp_px[1], thresholds.icp_px[2], thresholds.icp_px[3],
-                 thresholds.final_gate_px, thresholds.max_chained_delta_px);
+                 thresholds.final_gate_px, thresholds.max_chained_delta_px,
+                 span.start_idx, span.anchor_idx - 1,
+                 span.anchor_idx - span.start_idx);
 
     cv::Mat running_affine = cv::Mat::eye(2, 3, CV_64F);
     for (int idx = span.anchor_idx - 1; idx >= span.start_idx; --idx)
@@ -658,20 +641,37 @@ void repair_span(
         if (cache_it == frame_cache.end())
         {
             spdlog::warn("repair_span: frame {} missing from cache", idx);
-            return;
+            break;
         }
-        repair_single_frame(idx, span, cache_it->second, anchor, thresholds, board,
-                            running_affine, decoded);
+        const bool ok = repair_single_frame(
+            idx, span, cache_it->second, anchor, thresholds, board,
+            running_affine, decoded);
+        if (ok)
+        {
+            cured.push_back(idx);
+        }
     }
+    std::sort(cured.begin(), cured.end());
+    spdlog::info("repair_span: span [{},{}] cured={} / {} frames (dt_gap_ms={})",
+                 span.start_idx, span.anchor_idx - 1,
+                 cured.size(), span.anchor_idx - span.start_idx,
+                 span.dt_at_gap_ns / 1'000'000ULL);
+    return cured;
 }
 
 void invalidate_span(
     const UnrecoverableSpan&            span,
-    std::map<int, base::ImageDecoding>& decoded)
+    std::map<int, base::ImageDecoding>& decoded,
+    const std::vector<int>&             skip_cured)
 {
+    const std::unordered_set<int> skip(skip_cured.begin(), skip_cured.end());
     int invalidated_count = 0;
     for (int idx = span.start_idx; idx <= span.end_idx; ++idx)
     {
+        if (skip.count(idx))
+        {
+            continue;
+        }
         const auto decoded_it = decoded.find(idx);
         if (decoded_it == decoded.end())
         {
@@ -685,17 +685,26 @@ void invalidate_span(
         decoded.emplace(idx, build_failed_decoding(board_rows, board_cols));
         ++invalidated_count;
     }
-    spdlog::info("invalidate_span: frames [{}..{}] dropped from calibration ({} entries, dt_gap_ms={})",
-                 span.start_idx, span.end_idx, invalidated_count, span.dt_at_gap_ns / 1'000'000ULL);
+    spdlog::info("invalidate_span: frames [{}..{}] dropped from calibration "
+                 "({} entries, {} cured skipped, dt_gap_ms={})",
+                 span.start_idx, span.end_idx, invalidated_count,
+                 static_cast<int>(skip.size()),
+                 span.dt_at_gap_ns / 1'000'000ULL);
 }
 
 namespace
 {
+struct SpanOutcome
+{
+    Span              span;
+    std::vector<int>  cured;    // frame indices cured by back-propagation
+};
+
 void write_repair_report(
     const std::filesystem::path&               output_path,
     const uint64_t                             median_dt,
     const float                                gap_factor,
-    const std::vector<Span>&                   spans,
+    const std::vector<SpanOutcome>&            span_outcomes,
     const std::vector<UnrecoverableSpan>&      unrecoverable_spans)
 {
     if (output_path.empty())
@@ -710,25 +719,30 @@ void write_repair_report(
     }
     report << "# median_dt_ms: "   << (median_dt / 1'000'000ULL) << "\n";
     report << "# gap_factor: "     << gap_factor << "\n";
-    report << "# spans: "          << spans.size() << "\n";
+    report << "# spans: "          << span_outcomes.size() << "\n";
     report << "# unrecoverable: "  << unrecoverable_spans.size() << "\n";
-    for (size_t span_idx = 0; span_idx < spans.size(); ++span_idx)
+    for (size_t span_idx = 0; span_idx < span_outcomes.size(); ++span_idx)
     {
-        const auto& span = spans[span_idx];
+        const Span& span = span_outcomes[span_idx].span;
+        const int   span_length   = span.anchor_idx - span.start_idx;
+        const int   cured_count   = static_cast<int>(span_outcomes[span_idx].cured.size());
+        const int   remaining_bad = span_length - cured_count;
         report << "span " << span_idx
-               << ": start="           << span.start_idx
-               << " anchor="           << span.anchor_idx
-               << " dt_gap_ms="        << (span.dt_at_gap_ns / 1'000'000ULL)
-               << " repaired_frames="  << (span.anchor_idx - span.start_idx)
+               << ": start="              << span.start_idx
+               << " anchor="              << span.anchor_idx
+               << " dt_gap_ms="           << (span.dt_at_gap_ns / 1'000'000ULL)
+               << " span_frames="         << span_length
+               << " cured_frames="        << cured_count
+               << " invalidated_frames="  << remaining_bad
                << "\n";
     }
     for (size_t span_idx = 0; span_idx < unrecoverable_spans.size(); ++span_idx)
     {
         const auto& span = unrecoverable_spans[span_idx];
         report << "invalidated " << span_idx
-               << ": start="           << span.start_idx
-               << " end="              << span.end_idx
-               << " dt_gap_ms="        << (span.dt_at_gap_ns / 1'000'000ULL)
+               << ": start="             << span.start_idx
+               << " end="                << span.end_idx
+               << " dt_gap_ms="          << (span.dt_at_gap_ns / 1'000'000ULL)
                << " invalidated_frames=" << (span.end_idx - span.start_idx + 1)
                << "\n";
     }
@@ -750,26 +764,51 @@ void run_repair_pass(
 
     const uint64_t median_dt = median_dt_ns(frame_cache);
     const std::vector<Span> spans = detect_drop_affected_spans(
-        frame_cache, base_params.repair_gap_factor_, base_params.repair_max_span_len_);
+        frame_cache, base_params.repair_gap_factor_);
     const std::vector<UnrecoverableSpan> unrecoverable_spans = detect_unrecoverable_spans(
-        frame_cache, base_params.repair_gap_factor_,
-        base_params.repair_max_span_len_, base_params.repair_max_invalidation_span_);
+        frame_cache, base_params.repair_gap_factor_);
 
     spdlog::info("repair: median_dt_ms={} gap_factor={} spans={} unrecoverable={}",
                  median_dt / 1'000'000ULL, base_params.repair_gap_factor_,
                  spans.size(), unrecoverable_spans.size());
 
+    // Pass 1: back-propagate from each recoverable span's FCG anchor. The
+    // anti-alias guard inside repair_span decides which frames cure; the rest
+    // are invalidated below so they don't carry Hungarian IDs into calibration.
+    std::vector<SpanOutcome> span_outcomes;
+    span_outcomes.reserve(spans.size());
     for (auto iter = spans.rbegin(); iter != spans.rend(); ++iter)
     {
-        repair_span(*iter, frame_cache, base_params, board, decoded, output_path);
+        SpanOutcome outcome;
+        outcome.span  = *iter;
+        outcome.cured = repair_span(*iter, frame_cache, base_params, board, decoded, output_path);
+        span_outcomes.push_back(std::move(outcome));
     }
-    for (const auto& unrecoverable : unrecoverable_spans)
+    // Put span_outcomes back in start-index order for the report.
+    std::sort(span_outcomes.begin(), span_outcomes.end(),
+              [](const SpanOutcome& lhs, const SpanOutcome& rhs)
+              { return lhs.span.start_idx < rhs.span.start_idx; });
+
+    // Pass 2: invalidate the uncured frames of each recoverable span. Their
+    // pass-1 Hungarian IDs are untrusted: the chain broke on the anti-alias
+    // guard, so we can't vouch for them.
+    for (const SpanOutcome& outcome : span_outcomes)
+    {
+        UnrecoverableSpan virtual_span;
+        virtual_span.start_idx    = outcome.span.start_idx;
+        virtual_span.end_idx      = outcome.span.anchor_idx - 1;
+        virtual_span.dt_at_gap_ns = outcome.span.dt_at_gap_ns;
+        invalidate_span(virtual_span, decoded, outcome.cured);
+    }
+
+    // Pass 3: spans with no reachable FCG (hit another jump first, or EOF).
+    for (const UnrecoverableSpan& unrecoverable : unrecoverable_spans)
     {
         invalidate_span(unrecoverable, decoded);
     }
 
     write_repair_report(output_path, median_dt, base_params.repair_gap_factor_,
-                        spans, unrecoverable_spans);
+                        span_outcomes, unrecoverable_spans);
 }
 
 }  // namespace marker::repair
