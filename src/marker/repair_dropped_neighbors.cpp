@@ -388,6 +388,23 @@ struct Assignment
     int                      matched_count = 0;
 };
 
+/// Translation-unit-local disposition of one back-propagated frame.
+///
+/// Exposed only through `SpanRepairResult` at the public API boundary.
+///   kCured              — affine cure passed all checks; decoding replaced.
+///   kAntialiasRejected  — early-out (too few blobs, chained-delta jump, or
+///                         final matched_count < 4). The caller's gap sweep
+///                         will invalidate the frame under kGap.
+///   kPhantomRejected    — cure produced IDs but the virtual-row homography
+///                         check flagged them as row/column aliased; the
+///                         caller must invalidate the frame under kPhantom.
+enum class RepairOutcome
+{
+    kCured,
+    kAntialiasRejected,
+    kPhantomRejected,
+};
+
 /// Greedy one-to-one assignment: shortest pair wins, conflicts drop to the
 /// next pair in the sorted candidate list. O(N) in the number of candidates.
 Assignment resolve_pairs_greedy(
@@ -432,6 +449,198 @@ Assignment assign_greedy(
     }
     const std::vector<Pair> pairs = build_candidate_pairs(anchor, blob_positions, affine, threshold_px);
     return resolve_pairs_greedy(pairs, anchor, blob_positions);
+}
+
+// ---------------------------------------------------------------------------
+// Virtual-row alias detection (post-repair structural check)
+// ---------------------------------------------------------------------------
+//
+// After the affine chain has produced a candidate (blob -> gid) mapping, we
+// fit a homography from the board's intrinsic (row, col) lattice into the
+// current image and project a wide ring of *phantom* grid cells — cells that
+// sit outside the real 0..rows-1 / 0..cols-1 rectangle. If several phantom
+// cells land within one `final_gate_px` of *unidentified* blobs in the same
+// frame, those blobs form a coherent off-board lattice, which is the
+// signature of a row- or column-shift alias that slipped past the chained-
+// delta guard. See the diary
+// `docs/diary/2026-04-22-1030-virtual-row-alias-invalidation-wip.md` for the
+// failure mode this was introduced to catch (eposN_1 F556..F625).
+
+// The board uses the asymmetric-offset HexRing layout:
+//   x = 2*col + (row mod 2),  y = row
+// which is the canonical form used by createGridPoints() in the main target
+// implementation. We use the unitless form here — the homography absorbs the
+// scale — and compute parity with `((row % 2) + 2) % 2` so negative phantom
+// rows produce the same alternation as the real grid.
+int board_parity_for_row(const int row)
+{
+    return ((row % 2) + 2) % 2;
+}
+
+cv::Point2f board_lattice_point(const int row, const int col)
+{
+    const int parity = board_parity_for_row(row);
+    return cv::Point2f(static_cast<float>(2 * col + parity), static_cast<float>(row));
+}
+
+// Collect the (board_pts, image_pts) pairs usable to fit the homography.
+struct MatchedLatticePairs
+{
+    std::vector<cv::Point2f> board_pts;
+    std::vector<cv::Point2f> image_pts;
+};
+
+MatchedLatticePairs collect_matched_lattice_pairs(
+    const Assignment&               final_assignment,
+    const std::vector<cv::Point2f>& blob_positions,
+    const BoardCircleGrid&          board)
+{
+    MatchedLatticePairs pairs;
+    pairs.board_pts.reserve(final_assignment.matched_count);
+    pairs.image_pts.reserve(final_assignment.matched_count);
+    for (size_t blob_index = 0; blob_index < blob_positions.size(); ++blob_index)
+    {
+        const int gid = final_assignment.blob_to_gid[blob_index];
+        if (gid < 0)
+        {
+            continue;
+        }
+        const Eigen::Vector2i row_col = board.id_to_row_and_col(gid);
+        pairs.board_pts.push_back(board_lattice_point(row_col(0), row_col(1)));
+        pairs.image_pts.push_back(blob_positions[blob_index]);
+    }
+    return pairs;
+}
+
+// Enumerate the phantom cells that surround the real grid. For a rows x cols
+// board the full candidate box is
+//     r in [-(rows-1), 2*rows-1) = [-(rows-1), 2*rows-2]
+//     c in [-(cols-1), 2*cols-1) = [-(cols-1), 2*cols-2]
+// and we subtract the real 0..rows-1 / 0..cols-1 rectangle. That yields
+// rows=7, cols=5 -> 20*14 - 35 = 245 phantom cells, which matches the plan.
+std::vector<cv::Point2f> enumerate_phantom_board_points(
+    const int rows,
+    const int cols)
+{
+    std::vector<cv::Point2f> phantoms;
+    const int row_lo = -(rows - 1);
+    const int row_hi =  2 * rows - 1;   // exclusive
+    const int col_lo = -(cols - 1);
+    const int col_hi =  2 * cols - 1;   // exclusive
+    phantoms.reserve(static_cast<size_t>((row_hi - row_lo) * (col_hi - col_lo)));
+    for (int row = row_lo; row < row_hi; ++row)
+    {
+        for (int col = col_lo; col < col_hi; ++col)
+        {
+            const bool inside_real_grid =
+                (row >= 0) && (row < rows) && (col >= 0) && (col < cols);
+            if (inside_real_grid)
+            {
+                continue;
+            }
+            phantoms.push_back(board_lattice_point(row, col));
+        }
+    }
+    return phantoms;
+}
+
+// Count phantom cells whose projected image position has at least one
+// *unidentified* blob within `gate_px`. Multiple phantom cells may share the
+// same nearest blob — each phantom cell contributes at most one to the sum,
+// which matches the plan's "sum hits across ALL phantom cells" wording. A
+// single unidentified blob sitting inside a lattice-coherent cluster of
+// phantom cells (the bijective row-shift case) therefore produces one hit
+// per phantom cell, which is exactly the structural evidence we want to
+// flag.
+int count_phantom_hits(
+    const std::vector<cv::Point2f>& projected_phantoms,
+    const std::vector<cv::Point2f>& blob_positions,
+    const std::vector<int>&         blob_to_gid,
+    const float                     gate_px)
+{
+    const float gate_sq = gate_px * gate_px;
+    int hit_count = 0;
+    for (const cv::Point2f& projected : projected_phantoms)
+    {
+        float best_sq = std::numeric_limits<float>::max();
+        for (size_t blob_index = 0; blob_index < blob_positions.size(); ++blob_index)
+        {
+            if (blob_to_gid[blob_index] >= 0)
+            {
+                continue;
+            }
+            const float delta_x = projected.x - blob_positions[blob_index].x;
+            const float delta_y = projected.y - blob_positions[blob_index].y;
+            const float distance_sq = delta_x * delta_x + delta_y * delta_y;
+            if (distance_sq < best_sq)
+            {
+                best_sq = distance_sq;
+            }
+        }
+        if (best_sq <= gate_sq)
+        {
+            ++hit_count;
+        }
+    }
+    return hit_count;
+}
+
+// Return true iff the post-repair identification is row/column aliased.
+//
+// The check fits a homography board->image on the accepted matches, projects
+// every phantom lattice cell through it, and asks how many of those land on
+// currently unidentified blobs. A legitimate frame has few unidentified
+// blobs and they don't cluster on a shifted lattice, so random false
+// positives are unlikely; a row-shifted frame puts the entire orphaned row
+// onto phantom cells and therefore lights up many hits.
+//
+// Returns false on insufficient data (matched_count < 6) or degenerate
+// homography — we never invalidate on inability to decide.
+bool has_virtual_row_alias(
+    const int                       frame_idx,
+    const Assignment&               final_assignment,
+    const std::vector<cv::Point2f>& blob_positions,
+    const BoardCircleGrid&          board,
+    const GeometricThresholds&      thresholds)
+{
+    if (final_assignment.matched_count < 6)
+    {
+        return false;
+    }
+    const MatchedLatticePairs lattice =
+        collect_matched_lattice_pairs(final_assignment, blob_positions, board);
+    if (lattice.board_pts.size() < 6)
+    {
+        return false;
+    }
+    const cv::Mat homography = cv::findHomography(
+        lattice.board_pts, lattice.image_pts, cv::RANSAC,
+        static_cast<double>(thresholds.final_gate_px));
+    if (homography.empty())
+    {
+        return false;
+    }
+    const std::vector<cv::Point2f> phantom_board_pts =
+        enumerate_phantom_board_points(board.rows_, board.cols_);
+    if (phantom_board_pts.empty())
+    {
+        return false;
+    }
+    std::vector<cv::Point2f> projected_phantoms;
+    cv::perspectiveTransform(phantom_board_pts, projected_phantoms, homography);
+    const int hit_count = count_phantom_hits(
+        projected_phantoms, blob_positions, final_assignment.blob_to_gid,
+        thresholds.final_gate_px);
+    const bool aliased = hit_count > 3;
+    if (aliased)
+    {
+        spdlog::warn("repair_span: frame {} virtual-row aliased "
+                     "(phantom_hits={} on {} cells, matched={})",
+                     frame_idx, hit_count,
+                     static_cast<int>(phantom_board_pts.size()),
+                     final_assignment.matched_count);
+    }
+    return aliased;
 }
 
 /// Coarse-to-fine ICP: on each pass, build candidate pairs within the current
@@ -544,7 +753,7 @@ float translation_delta_px(const cv::Mat& affine_a, const cv::Mat& affine_b)
     return static_cast<float>(std::sqrt(delta_x * delta_x + delta_y * delta_y));
 }
 
-bool repair_single_frame(
+RepairOutcome repair_single_frame(
     const int                           frame_idx,
     const Span&                         span,
     const FrameCacheEntry&              frame_entry,
@@ -559,7 +768,7 @@ bool repair_single_frame(
     {
         spdlog::warn("repair_span: frame {} has only {} coding blobs — skipping",
                      frame_idx, blob_positions.size());
-        return false;
+        return RepairOutcome::kAntialiasRejected;
     }
 
     const cv::Mat trial_affine = refine_affine(anchor, blob_positions, running_affine, thresholds.icp_px);
@@ -569,7 +778,7 @@ bool repair_single_frame(
         spdlog::warn("repair_span: frame {} affine translation jumped {:.1f}px (>{:.1f}px = "
                      "1.2*d_nn) — likely row-alias, skipping",
                      frame_idx, jump_px, thresholds.max_chained_delta_px);
-        return false;
+        return RepairOutcome::kAntialiasRejected;
     }
     running_affine = trial_affine;
 
@@ -580,7 +789,19 @@ bool repair_single_frame(
     {
         spdlog::warn("repair_span: frame {} matched only {} markers — leaving as-is",
                      frame_idx, final_assignment.matched_count);
-        return false;
+        return RepairOutcome::kAntialiasRejected;
+    }
+
+    // Post-repair structural check. The chained-delta guard only catches
+    // column-shift aliases (magnitude 2*d_nn); row shifts sit at d_nn/sqrt(2)
+    // ≈ 0.7*d_nn, under the 1.2*d_nn cap, so they slip through the first
+    // gate. The virtual-row homography check catches them from the other
+    // side by looking for unidentified blobs that fit an off-board lattice.
+    if (has_virtual_row_alias(frame_idx, final_assignment, blob_positions, board, thresholds))
+    {
+        spdlog::warn("repair_span: frame {} row-aliased (virtual-row check) — invalidating",
+                     frame_idx);
+        return RepairOutcome::kPhantomRejected;
     }
 
     const cv::Mat1b image = load_frame_image(frame_entry);
@@ -593,11 +814,11 @@ bool repair_single_frame(
     spdlog::info("repair_span: frame {} repaired via affine (anchor={}, matched={}/{}, dt_gap_ms={})",
                  frame_idx, span.anchor_idx, final_assignment.matched_count, anchor.gids.size(),
                  span.dt_at_gap_ns / 1'000'000ULL);
-    return true;
+    return RepairOutcome::kCured;
 }
 }  // namespace
 
-std::vector<int> repair_span(
+SpanRepairResult repair_span(
     const Span& span,
     const std::map<int, FrameCacheEntry>& frame_cache,
     const DetectionParameters& /*base_params*/,
@@ -605,25 +826,25 @@ std::vector<int> repair_span(
     std::map<int, base::ImageDecoding>& decoded,
     const std::filesystem::path& /*output_path*/)
 {
-    std::vector<int> cured;
+    SpanRepairResult result;
     const auto anchor_it = frame_cache.find(span.anchor_idx);
     if (anchor_it == frame_cache.end() || !anchor_it->second.fcg_succeeded)
     {
         spdlog::warn("repair_span: anchor {} missing or not FCG — skipping", span.anchor_idx);
-        return cured;
+        return result;
     }
     const AnchorReference anchor = extract_anchor_reference(anchor_it->second);
     if (anchor.gids.size() < 4)
     {
         spdlog::warn("repair_span: anchor {} has only {} identified markers — skipping span",
                      span.anchor_idx, anchor.gids.size());
-        return cured;
+        return result;
     }
     if (anchor.median_nn_distance_px <= 0.f)
     {
         spdlog::warn("repair_span: anchor {} has degenerate geometry (d_nn=0) — skipping span",
                      span.anchor_idx);
-        return cured;
+        return result;
     }
     const GeometricThresholds thresholds = thresholds_from_scale(anchor.median_nn_distance_px);
     spdlog::info("repair_span: anchor {} d_nn={:.1f}px -> icp[{:.1f},{:.1f},{:.1f},{:.1f}] "
@@ -643,25 +864,42 @@ std::vector<int> repair_span(
             spdlog::warn("repair_span: frame {} missing from cache", idx);
             break;
         }
-        const bool ok = repair_single_frame(
+        const RepairOutcome outcome = repair_single_frame(
             idx, span, cache_it->second, anchor, thresholds, board,
             running_affine, decoded);
-        if (ok)
+        switch (outcome)
         {
-            cured.push_back(idx);
+            case RepairOutcome::kCured:
+            {
+                result.cured.push_back(idx);
+                break;
+            }
+            case RepairOutcome::kPhantomRejected:
+            {
+                result.phantom_rejected.push_back(idx);
+                break;
+            }
+            case RepairOutcome::kAntialiasRejected:
+            {
+                // Fall through — left for the caller's gap sweep to invalidate.
+                break;
+            }
         }
     }
-    std::sort(cured.begin(), cured.end());
-    spdlog::info("repair_span: span [{},{}] cured={} / {} frames (dt_gap_ms={})",
+    std::sort(result.cured.begin(), result.cured.end());
+    std::sort(result.phantom_rejected.begin(), result.phantom_rejected.end());
+    spdlog::info("repair_span: span [{},{}] cured={} phantom={} / {} frames (dt_gap_ms={})",
                  span.start_idx, span.anchor_idx - 1,
-                 cured.size(), span.anchor_idx - span.start_idx,
+                 result.cured.size(), result.phantom_rejected.size(),
+                 span.anchor_idx - span.start_idx,
                  span.dt_at_gap_ns / 1'000'000ULL);
-    return cured;
+    return result;
 }
 
 void invalidate_span(
     const UnrecoverableSpan&            span,
     std::map<int, base::ImageDecoding>& decoded,
+    const InvalidationReason            reason,
     const std::vector<int>&             skip_cured)
 {
     const std::unordered_set<int> skip(skip_cured.begin(), skip_cured.end());
@@ -685,10 +923,13 @@ void invalidate_span(
         decoded.emplace(idx, build_failed_decoding(board_rows, board_cols));
         ++invalidated_count;
     }
+    const char* const reason_str =
+        (reason == InvalidationReason::kPhantom) ? "phantom" : "gap";
     spdlog::info("invalidate_span: frames [{}..{}] dropped from calibration "
-                 "({} entries, {} cured skipped, dt_gap_ms={})",
+                 "({} entries, {} cured skipped, reason={}, dt_gap_ms={})",
                  span.start_idx, span.end_idx, invalidated_count,
                  static_cast<int>(skip.size()),
+                 reason_str,
                  span.dt_at_gap_ns / 1'000'000ULL);
 }
 
@@ -697,7 +938,8 @@ namespace
 struct SpanOutcome
 {
     Span              span;
-    std::vector<int>  cured;    // frame indices cured by back-propagation
+    std::vector<int>  cured;              // frame indices cured by back-propagation
+    std::vector<int>  phantom_rejected;   // frames flagged by the virtual-row check
 };
 
 void write_repair_report(
@@ -724,16 +966,18 @@ void write_repair_report(
     for (size_t span_idx = 0; span_idx < span_outcomes.size(); ++span_idx)
     {
         const Span& span = span_outcomes[span_idx].span;
-        const int   span_length   = span.anchor_idx - span.start_idx;
-        const int   cured_count   = static_cast<int>(span_outcomes[span_idx].cured.size());
-        const int   remaining_bad = span_length - cured_count;
+        const int   span_length     = span.anchor_idx - span.start_idx;
+        const int   cured_count     = static_cast<int>(span_outcomes[span_idx].cured.size());
+        const int   phantom_count   = static_cast<int>(span_outcomes[span_idx].phantom_rejected.size());
+        const int   antialias_count = span_length - cured_count - phantom_count;
         report << "span " << span_idx
                << ": start="              << span.start_idx
                << " anchor="              << span.anchor_idx
                << " dt_gap_ms="           << (span.dt_at_gap_ns / 1'000'000ULL)
                << " span_frames="         << span_length
-               << " cured_frames="        << cured_count
-               << " invalidated_frames="  << remaining_bad
+               << " cured="               << cured_count
+               << " phantom="             << phantom_count
+               << " antialias="           << antialias_count
                << "\n";
     }
     for (size_t span_idx = 0; span_idx < unrecoverable_spans.size(); ++span_idx)
@@ -773,15 +1017,20 @@ void run_repair_pass(
                  spans.size(), unrecoverable_spans.size());
 
     // Pass 1: back-propagate from each recoverable span's FCG anchor. The
-    // anti-alias guard inside repair_span decides which frames cure; the rest
-    // are invalidated below so they don't carry Hungarian IDs into calibration.
+    // anti-alias guard inside repair_span decides which frames cure; the
+    // virtual-row homography check flags row-aliased ones as phantom; the
+    // rest are invalidated below so they don't carry Hungarian IDs into
+    // calibration.
     std::vector<SpanOutcome> span_outcomes;
     span_outcomes.reserve(spans.size());
     for (auto iter = spans.rbegin(); iter != spans.rend(); ++iter)
     {
         SpanOutcome outcome;
-        outcome.span  = *iter;
-        outcome.cured = repair_span(*iter, frame_cache, base_params, board, decoded, output_path);
+        outcome.span = *iter;
+        SpanRepairResult repair_result = repair_span(
+            *iter, frame_cache, base_params, board, decoded, output_path);
+        outcome.cured            = std::move(repair_result.cured);
+        outcome.phantom_rejected = std::move(repair_result.phantom_rejected);
         span_outcomes.push_back(std::move(outcome));
     }
     // Put span_outcomes back in start-index order for the report.
@@ -789,22 +1038,46 @@ void run_repair_pass(
               [](const SpanOutcome& lhs, const SpanOutcome& rhs)
               { return lhs.span.start_idx < rhs.span.start_idx; });
 
-    // Pass 2: invalidate the uncured frames of each recoverable span. Their
-    // pass-1 Hungarian IDs are untrusted: the chain broke on the anti-alias
-    // guard, so we can't vouch for them.
+    // Pass 2a: invalidate phantom-rejected frames explicitly under
+    // reason=kPhantom. Each phantom-rejected frame is its own 1-frame
+    // "span" for reporting purposes so the gap sweep below can't double-log
+    // it. The phantom list is sparse and non-contiguous, so we process the
+    // frames one at a time instead of constructing one big UnrecoverableSpan.
+    for (const SpanOutcome& outcome : span_outcomes)
+    {
+        for (const int phantom_idx : outcome.phantom_rejected)
+        {
+            UnrecoverableSpan phantom_span;
+            phantom_span.start_idx    = phantom_idx;
+            phantom_span.end_idx      = phantom_idx;
+            phantom_span.dt_at_gap_ns = outcome.span.dt_at_gap_ns;
+            invalidate_span(phantom_span, decoded, InvalidationReason::kPhantom);
+        }
+    }
+
+    // Pass 2b: invalidate the uncured, non-phantom frames of each recoverable
+    // span. Their pass-1 Hungarian IDs are untrusted: the chain broke on the
+    // anti-alias guard, so we can't vouch for them. Skip both the cured and
+    // the phantom-rejected frames so we neither re-stomp their decodings nor
+    // mislabel them as reason=kGap in the log.
     for (const SpanOutcome& outcome : span_outcomes)
     {
         UnrecoverableSpan virtual_span;
         virtual_span.start_idx    = outcome.span.start_idx;
         virtual_span.end_idx      = outcome.span.anchor_idx - 1;
         virtual_span.dt_at_gap_ns = outcome.span.dt_at_gap_ns;
-        invalidate_span(virtual_span, decoded, outcome.cured);
+        std::vector<int> skip;
+        skip.reserve(outcome.cured.size() + outcome.phantom_rejected.size());
+        skip.insert(skip.end(), outcome.cured.begin(), outcome.cured.end());
+        skip.insert(skip.end(), outcome.phantom_rejected.begin(),
+                    outcome.phantom_rejected.end());
+        invalidate_span(virtual_span, decoded, InvalidationReason::kGap, skip);
     }
 
     // Pass 3: spans with no reachable FCG (hit another jump first, or EOF).
     for (const UnrecoverableSpan& unrecoverable : unrecoverable_spans)
     {
-        invalidate_span(unrecoverable, decoded);
+        invalidate_span(unrecoverable, decoded, InvalidationReason::kGap);
     }
 
     write_repair_report(output_path, median_dt, base_params.repair_gap_factor_,

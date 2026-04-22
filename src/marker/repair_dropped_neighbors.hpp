@@ -14,6 +14,34 @@
 namespace marker::repair
 {
 
+// Why a given frame was dropped from calibration during the repair pass.
+//   kGap     — the span had no reachable FCG before the next jump / EOF, so
+//              the frame's pass-1 Hungarian IDs are untrusted and we bail
+//              out without ever attempting an affine cure.
+//   kPhantom — repair fit an affine and matched blobs, but the final
+//              homography check found a "virtual-row" alias (see
+//              has_virtual_row_alias in the .cpp), so we invalidate the
+//              frame rather than emit wrong IDs into calibration.
+enum class InvalidationReason
+{
+    kGap,
+    kPhantom,
+};
+
+// Outcome of back-propagation across one recoverable span.
+//   cured             — frames that were successfully relabelled
+//                       via the per-span affine chain.
+//   phantom_rejected  — frames where repair produced IDs but the virtual-row
+//                       homography check flagged them as row/column aliased
+//                       and therefore must be invalidated under kPhantom.
+// Frames neither cured nor phantom_rejected are antialias-rejected and get
+// invalidated by the caller's second sweep under reason kGap.
+struct SpanRepairResult
+{
+    std::vector<int> cured;
+    std::vector<int> phantom_rejected;
+};
+
 struct FrameCacheEntry
 {
     uint64_t                         ts_ns            = 0;
@@ -68,10 +96,15 @@ std::vector<UnrecoverableSpan> detect_unrecoverable_spans(
 
 // Back-propagate IDs from `span.anchor_idx` (an FCG) through frames
 // `[anchor_idx-1 .. start_idx]`, writing repaired `ImageDecoding` entries
-// into `decoded`. Returns the sorted list of frame indices that were cured.
-// Uncured frames keep their pre-repair decoded entries; the caller is
-// expected to invalidate them (they carry untrusted pass-1 Hungarian IDs).
-std::vector<int> repair_span(
+// into `decoded`. Returns a `SpanRepairResult` with two sorted index lists:
+//   - `cured`            — frames successfully relabelled by the affine chain
+//   - `phantom_rejected` — frames where repair matched enough blobs but the
+//                          virtual-row homography check flagged the fit as
+//                          row/column aliased; the caller must invalidate
+//                          them under `InvalidationReason::kPhantom`.
+// Frames that appear in neither list are antialias-rejected; the caller's
+// gap sweep invalidates them under `InvalidationReason::kGap`.
+SpanRepairResult repair_span(
     const Span& span,
     const std::map<int, FrameCacheEntry>& frame_cache,
     const DetectionParameters& base_params,
@@ -80,12 +113,15 @@ std::vector<int> repair_span(
     const std::filesystem::path& output_path);
 
 // Mark the frames in the span as failed in `decoded` so they drop out of
-// downstream calibration. Frame indices listed in `skip_cured` are left
-// untouched — the caller uses this to preserve frames already cured by a
-// prior `repair_span` call on an overlapping recoverable span.
+// downstream calibration. The `reason` is reported verbatim in the log line
+// so operators can tell gap-driven invalidations from phantom-driven ones.
+// Frame indices listed in `skip_cured` are left untouched — the caller uses
+// this to preserve frames already cured (or already phantom-invalidated)
+// by a prior pass on an overlapping span.
 void invalidate_span(
     const UnrecoverableSpan&            span,
     std::map<int, base::ImageDecoding>& decoded,
+    InvalidationReason                  reason,
     const std::vector<int>&             skip_cured = {});
 
 void run_repair_pass(
