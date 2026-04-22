@@ -15,7 +15,7 @@
 # "without cache" so every run reprocesses from raw images.
 set -euo pipefail
 
-COMPOSE=/home/kmro/praca/dev/kalibr-ws-dops/src/kalibr/docker-compose.verification.yml
+COMPOSE=$HOME/praca/dev/kalibr-ws-dops/src/kalibr/docker-compose.verification.yml
 if [[ ! -f "${COMPOSE}" ]]; then
   echo "docker-compose file not found at ${COMPOSE}" >&2
   exit 1
@@ -24,7 +24,7 @@ fi
 : "${KALIBR_IMAGE:=dops-kalibr}"
 export KALIBR_IMAGE
 
-DATASETS_ROOT=/home/kmro/praca/dev/datasets/nav-operations
+DATASETS_ROOT=$HOME/praca/dev/datasets/nav-operations
 DATASETS=(
   imx219_circlegrid_nord4_1
   imx219_circlegrid_nord4_2
@@ -34,7 +34,7 @@ DATASETS=(
   thermal_circlegrid_eposN_4
 )
 
-SWEEP_OUT=/home/kmro/praca/dev/kalibr-ws-dops/repair_sweep_results
+SWEEP_OUT=$HOME/praca/dev/kalibr-ws-dops/repair_sweep_results
 mkdir -p "${SWEEP_OUT}"
 SUMMARY="${SWEEP_OUT}/repair_sweep_summary.csv"
 echo "dataset,mode,rid,identified_total,fcg_count,spans,reproj_rmse" > "${SUMMARY}"
@@ -105,4 +105,4 @@ echo
 echo "Sweep complete. Summary: ${SUMMARY}"
 
 # Audible notification — user preference (see memory/feedback_notification_sound.md).
-(play /home/kmro/dev/notification.mp3 2>/dev/null || true) &
+(play $HOME/dev/notification.mp3 2>/dev/null || true) &

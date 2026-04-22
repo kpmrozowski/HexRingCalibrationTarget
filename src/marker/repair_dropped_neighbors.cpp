@@ -4,6 +4,7 @@
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <unordered_set>
 
 #include <Eigen/Core>
@@ -468,10 +469,12 @@ Assignment assign_greedy(
 
 // The board uses the asymmetric-offset HexRing layout:
 //   x = 2*col + (row mod 2),  y = row
-// which is the canonical form used by createGridPoints() in the main target
-// implementation. We use the unitless form here — the homography absorbs the
-// scale — and compute parity with `((row % 2) + 2) % 2` so negative phantom
-// rows produce the same alternation as the real grid.
+// Canonical source: `GridCalibrationTargetCirclegridHexRing::createGridPoints()`
+// in `aslam_cv/aslam_cameras_circlegrid_hexring/src/GridCalibrationTargetCirclegridHexRing.cpp`,
+// and the workspace CLAUDE.md "HexRing target grid geometry" section.
+// We use the unitless form here — the homography absorbs the scale — and
+// compute parity with `((row % 2) + 2) % 2` so negative phantom rows
+// produce the same alternation as the real grid.
 int board_parity_for_row(const int row)
 {
     return ((row % 2) + 2) % 2;
@@ -643,6 +646,178 @@ bool has_virtual_row_alias(
     return aliased;
 }
 
+// Attempt to cure a row-/column-aliased labeling by shifting every matched
+// gid by (dx, dy) in *physical* lattice coordinates. Returns the corrected
+// blob_to_gid vector if the post-shift phantom check comes back clean,
+// nullopt otherwise.
+//
+// Board geometry reference — canonical:
+//   - `GridCalibrationTargetCirclegridHexRing::createGridPoints()` in
+//     `aslam_cv/aslam_cameras_circlegrid_hexring/src/GridCalibrationTargetCirclegridHexRing.cpp`
+//   - Workspace CLAUDE.md section "HexRing target grid geometry".
+// Asymmetric layout (the only mode used in production): each grid point at
+// index (row, col) has physical coords (x, y) = (2*col + row%2, row) times
+// spacing_meters.  Neighbor distances are d_nn = s*sqrt(2) diagonally and
+// 2s horizontally.
+//
+// Why physical coords, not (dr, dc): a uniform (dr, dc) in board-index
+// space does NOT correspond to a consistent image translation when row
+// parity changes — even-row labels at dc=0 land correctly on odd-target
+// rows, but odd-row labels at dc=0 miss by one column because the odd-row
+// parity offset flips. Using physical (dx, dy) and recomputing
+// (new_r, new_c) per-blob from the new lattice position handles parity
+// correctly: the same image translation maps cleanly across even and odd
+// source rows.
+//
+// Candidate range: dx in [-(2*cols-1), 2*cols-1], dy in [-(rows-1), rows-1]
+// (the full physical bounding box that any shift can cover before all blobs
+// fall off the board), sorted by Manhattan distance so the smallest shifts
+// are tried first.
+struct PhysicalShift
+{
+    int dx;  // in units of spacing (lattice x = 2*c + r%2)
+    int dy;  // in units of spacing (lattice y = r)
+};
+
+// Translate a board-index (row, col) by a physical shift and return the new
+// (row, col) on the lattice, or false if the shifted position falls off the
+// board or between lattice sites (which happens when the x-parity of the
+// shifted y doesn't match the destination x).
+struct ShiftedRowCol
+{
+    int  row   = 0;
+    int  col   = 0;
+    bool valid = false;
+};
+
+ShiftedRowCol apply_physical_shift(
+    const int            old_row,
+    const int            old_col,
+    const PhysicalShift& shift,
+    const int            rows,
+    const int            cols)
+{
+    const int new_row = old_row + shift.dy;
+    if (new_row < 0 || new_row >= rows)
+    {
+        return ShiftedRowCol{0, 0, false};
+    }
+    const int old_x_phys = 2 * old_col + (old_row % 2);
+    const int new_x_phys = old_x_phys + shift.dx;
+    const int new_parity = new_row % 2;
+    // x = 2*c + parity → c = (x - parity) / 2, and that must be a non-negative
+    // integer for the new position to fall on a lattice site.
+    const int c_numerator = new_x_phys - new_parity;
+    if (c_numerator < 0 || (c_numerator % 2) != 0)
+    {
+        return ShiftedRowCol{0, 0, false};
+    }
+    const int new_col = c_numerator / 2;
+    if (new_col < 0 || new_col >= cols)
+    {
+        return ShiftedRowCol{0, 0, false};
+    }
+    return ShiftedRowCol{new_row, new_col, true};
+}
+
+std::vector<PhysicalShift> build_physical_shift_candidates(const BoardCircleGrid& board)
+{
+    std::vector<PhysicalShift> candidates;
+    const int dx_extent = 2 * board.cols_ - 1;
+    const int dy_extent = board.rows_ - 1;
+    candidates.reserve(static_cast<size_t>((2 * dx_extent + 1) * (2 * dy_extent + 1) - 1));
+    for (int dy = -dy_extent; dy <= dy_extent; ++dy)
+    {
+        for (int dx = -dx_extent; dx <= dx_extent; ++dx)
+        {
+            if (dx == 0 && dy == 0)
+            {
+                continue;
+            }
+            candidates.push_back(PhysicalShift{dx, dy});
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const PhysicalShift& lhs, const PhysicalShift& rhs)
+              {
+                  const int manhattan_lhs = std::abs(lhs.dx) + std::abs(lhs.dy);
+                  const int manhattan_rhs = std::abs(rhs.dx) + std::abs(rhs.dy);
+                  if (manhattan_lhs != manhattan_rhs)
+                  {
+                      return manhattan_lhs < manhattan_rhs;
+                  }
+                  // Within a shell, prefer row-dominated shifts (|dy| large).
+                  const int abs_dy_lhs = std::abs(lhs.dy);
+                  const int abs_dy_rhs = std::abs(rhs.dy);
+                  if (abs_dy_lhs != abs_dy_rhs)
+                  {
+                      return abs_dy_lhs > abs_dy_rhs;
+                  }
+                  return std::tie(lhs.dx, lhs.dy) < std::tie(rhs.dx, rhs.dy);
+              });
+    return candidates;
+}
+
+struct CureResult
+{
+    std::vector<int> blob_to_gid;
+    int              matched_count = 0;
+    int              dx            = 0;
+    int              dy            = 0;
+};
+
+std::optional<CureResult> attempt_shift_cure(
+    const int                       frame_idx,
+    const Assignment&               final_assignment,
+    const std::vector<cv::Point2f>& blob_positions,
+    const BoardCircleGrid&          board,
+    const GeometricThresholds&      thresholds)
+{
+    const std::vector<PhysicalShift> shift_candidates = build_physical_shift_candidates(board);
+    for (const PhysicalShift& shift : shift_candidates)
+    {
+        std::vector<int> candidate_blob_to_gid(blob_positions.size(), -1);
+        int              match_count = 0;
+        for (size_t blob_index = 0; blob_index < blob_positions.size(); ++blob_index)
+        {
+            const int old_gid = final_assignment.blob_to_gid[blob_index];
+            if (old_gid < 0)
+            {
+                continue;
+            }
+            const Eigen::Vector2i row_col = board.id_to_row_and_col(old_gid);
+            const ShiftedRowCol shifted = apply_physical_shift(
+                row_col(0), row_col(1), shift, board.rows_, board.cols_);
+            if (!shifted.valid)
+            {
+                continue;
+            }
+            candidate_blob_to_gid[blob_index] = shifted.row * board.cols_ + shifted.col;
+            ++match_count;
+        }
+        if (match_count < 6)
+        {
+            continue;
+        }
+        Assignment candidate;
+        candidate.blob_to_gid   = std::move(candidate_blob_to_gid);
+        candidate.matched_count = match_count;
+        const bool still_aliased = has_virtual_row_alias(
+            frame_idx, candidate, blob_positions, board, thresholds);
+        if (still_aliased)
+        {
+            continue;
+        }
+        CureResult cure;
+        cure.blob_to_gid   = std::move(candidate.blob_to_gid);
+        cure.matched_count = match_count;
+        cure.dx            = shift.dx;
+        cure.dy            = shift.dy;
+        return cure;
+    }
+    return std::nullopt;
+}
+
 /// Coarse-to-fine ICP: on each pass, build candidate pairs within the current
 /// threshold, re-fit an affine-partial-2D model (translation + rotation +
 /// uniform scale) on the matched endpoints, and shrink the threshold.
@@ -782,7 +957,10 @@ RepairOutcome repair_single_frame(
     }
     running_affine = trial_affine;
 
-    const Assignment final_assignment =
+    // Non-const: row-shift cure (below) may rewrite blob_to_gid / matched_count
+    // in place when the virtual-row check fires and a single-row relabel
+    // restores a clean homography fit.
+    Assignment final_assignment =
         assign_greedy(anchor, blob_positions, running_affine, thresholds.final_gate_px);
 
     if (final_assignment.matched_count < 4)
@@ -799,9 +977,19 @@ RepairOutcome repair_single_frame(
     // side by looking for unidentified blobs that fit an off-board lattice.
     if (has_virtual_row_alias(frame_idx, final_assignment, blob_positions, board, thresholds))
     {
-        spdlog::warn("repair_span: frame {} row-aliased (virtual-row check) — invalidating",
-                     frame_idx);
-        return RepairOutcome::kPhantomRejected;
+        const std::optional<CureResult> cure = attempt_shift_cure(
+            frame_idx, final_assignment, blob_positions, board, thresholds);
+        if (!cure.has_value())
+        {
+            spdlog::warn("repair_span: frame {} row-aliased, no shift cure — invalidating",
+                         frame_idx);
+            return RepairOutcome::kPhantomRejected;
+        }
+        spdlog::info("repair_span: frame {} row-shift-cured via physical (dx={}, dy={}) — "
+                     "re-labeled {} matches after phantom trip",
+                     frame_idx, cure->dx, cure->dy, cure->matched_count);
+        final_assignment.blob_to_gid   = cure->blob_to_gid;
+        final_assignment.matched_count = cure->matched_count;
     }
 
     const cv::Mat1b image = load_frame_image(frame_entry);
