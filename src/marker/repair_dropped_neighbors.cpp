@@ -309,25 +309,6 @@ std::vector<cv::Point2f> blob_positions_of(const std::vector<base::MarkerCoding>
     return positions;
 }
 
-cv::Mat1b load_frame_image(const FrameCacheEntry& entry)
-{
-    if (!entry.cached_image_png.empty())
-    {
-        // PNG is lossless so decoded pixels match the original gray frame.
-        const cv::Mat decoded = cv::imdecode(entry.cached_image_png, cv::IMREAD_GRAYSCALE);
-        return decoded;
-    }
-    if (!entry.cached_image.empty())
-    {
-        return entry.cached_image;
-    }
-    if (!entry.image_path.empty())
-    {
-        return cv::imread(entry.image_path.string(), cv::IMREAD_GRAYSCALE);
-    }
-    return cv::Mat1b();
-}
-
 cv::Point2f apply_affine(const cv::Mat& affine, const cv::Point2f& point)
 {
     const double m00 = affine.at<double>(0, 0);
@@ -1011,6 +992,29 @@ RepairOutcome repair_single_frame(
     return RepairOutcome::kCured;
 }
 }  // namespace
+
+// Decode the per-frame backup image stored in a FrameCacheEntry. Lives at
+// marker::repair namespace scope (not in the file-local anonymous block above)
+// because CircleGridCalibInterface::rerenderRepairedDebugImages reaches into
+// it from the parent kalibr package — see repair_dropped_neighbors.hpp for
+// the public declaration.
+cv::Mat1b load_frame_image(const FrameCacheEntry& entry)
+{
+    if (!entry.cached_image_png.empty())
+    {
+        // PNG is lossless so decoded pixels match the original gray frame.
+        return cv::imdecode(entry.cached_image_png, cv::IMREAD_GRAYSCALE);
+    }
+    if (!entry.cached_image.empty())
+    {
+        return entry.cached_image;
+    }
+    if (!entry.image_path.empty())
+    {
+        return cv::imread(entry.image_path.string(), cv::IMREAD_GRAYSCALE);
+    }
+    return cv::Mat1b();
+}
 
 SpanRepairResult repair_span(
     const Span& span,
