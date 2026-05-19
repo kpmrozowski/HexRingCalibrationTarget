@@ -80,6 +80,14 @@ struct UnrecoverableSpan
 
 uint64_t median_dt_ns(const std::map<int, FrameCacheEntry>& frame_cache);
 
+// Decode the per-frame backup image stored in a FrameCacheEntry. Returns
+// the PNG-decoded buffer when cached_image_png is populated (the low-RAM
+// path used by CircleGridCalibInterface since VN-3980); otherwise falls
+// back to the raw cv::Mat1b cached_image; otherwise loads from image_path;
+// otherwise an empty Mat. Used by callers that need pixel data outside of
+// load_frame_image()'s file scope (e.g. debug rendering).
+cv::Mat1b load_frame_image(const FrameCacheEntry& entry);
+
 // Spans whose next-boundary scan (unbounded) reaches a FCG success before the
 // next timestamp jump. The FCG becomes the back-propagation anchor for the
 // whole stretch; the anti-alias guard inside repair_span() decides which
