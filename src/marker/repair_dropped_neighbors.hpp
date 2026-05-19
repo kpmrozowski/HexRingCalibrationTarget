@@ -49,8 +49,9 @@ struct FrameCacheEntry
     std::vector<cv::Point2f>         marker_positions;   // indexed by gid; (-1,-1) if unset
     std::string                      method;
     int                              identified_count = 0;
-    std::filesystem::path            image_path;         // used when cached_image is empty
-    cv::Mat1b                        cached_image;       // in-memory image for pipelines without a path
+    std::filesystem::path            image_path;         // used when cached_image* are empty
+    cv::Mat1b                        cached_image;       // raw in-memory image (legacy callers)
+    std::vector<uchar>               cached_image_png;   // PNG-encoded image (preferred — ~5x less RAM than raw cv::Mat1b)
     bool                             fcg_succeeded    = false;
 };
 

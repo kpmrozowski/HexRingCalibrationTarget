@@ -311,6 +311,12 @@ std::vector<cv::Point2f> blob_positions_of(const std::vector<base::MarkerCoding>
 
 cv::Mat1b load_frame_image(const FrameCacheEntry& entry)
 {
+    if (!entry.cached_image_png.empty())
+    {
+        // PNG is lossless so decoded pixels match the original gray frame.
+        const cv::Mat decoded = cv::imdecode(entry.cached_image_png, cv::IMREAD_GRAYSCALE);
+        return decoded;
+    }
     if (!entry.cached_image.empty())
     {
         return entry.cached_image;
