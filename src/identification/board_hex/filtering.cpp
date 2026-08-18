@@ -476,6 +476,25 @@ std::set<Edge> get_incorrect_crossing_edges(const std::vector<base::MarkerNeighb
             break;
         }
 
+        // The loop continues while any pair still crosses, but a pair is only
+        // selected when one of its edges has strictly more support than the
+        // other. Those two conditions disagree when every remaining crossing is
+        // a perfect tie: crossing_exist is true, yet nothing is selected and
+        // idx_biggest_diff stays -1. Indexing edge_stats with it read far out of
+        // bounds, and copying the garbage that came back asked for an absurd
+        // allocation -- which is how this surfaced, as bad_array_new_length,
+        // bad_alloc or SIGSEGV inside the detector rather than here.
+        //
+        // A tie means both edges of the crossing are equally supported, so there
+        // is no evidence to prefer removing either one. Stop resolving instead
+        // of picking arbitrarily; the remaining crossings stay in the graph, as
+        // they already do for any pair this heuristic does not flag.
+        if (idx_biggest_diff < 0)
+        {
+            spdlog::debug("crossing edges: remaining pair(s) tied on support; leaving them unresolved");
+            break;
+        }
+
         dbg_actual_processing_order.push_back(idx_biggest_diff);
 
         // const auto &[edge_a, edge_b] = *std::next(crossing_edge_pairs.begin(), idx);
