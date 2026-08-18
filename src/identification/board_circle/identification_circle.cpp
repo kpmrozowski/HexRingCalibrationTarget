@@ -21,6 +21,61 @@
 namespace
 {
 
+/// Resolution the absolute pixel tolerances in this file were tuned against.
+constexpr float kReferenceImagePixels = 800.f * 600.f;
+
+/// Multiplier applied to those tolerances; 1.0 until set_resolution_scale().
+float g_resolution_scale = 1.0f;
+
+/// Scale a tolerance that was expressed in pixels at the reference resolution.
+inline float scaled_px(const float reference_px)
+{
+    return reference_px * g_resolution_scale;
+}
+
+/// Marker spacing, in pixels, that OpenCV's CirclesGridFinderParameters defaults
+/// assume. Derived from the 800x600 tuning resolution: this board family images
+/// at ~94 px spacing on a 1640x1232 sensor, which is ~46 px once scaled back by
+/// sqrt(area). Rounded to 45. Only the ratio to the measured spacing matters, so
+/// a modest error here shifts all three parameters together rather than
+/// distorting their balance.
+constexpr float kReferenceMarkerSpacingPx = 45.f;
+
+/// Median distance from each keypoint to its nearest neighbour, in pixels.
+/// Median rather than mean so a few stray detections far from the board -- which
+/// are exactly what shows up on a partially-visible target -- cannot inflate it.
+/// Returns 0 when there are too few points to measure.
+float median_nearest_neighbour_distance(const std::vector<cv::KeyPoint>& keypoints)
+{
+    const std::size_t count = keypoints.size();
+    if (count < 2)
+    {
+        return 0.f;
+    }
+
+    std::vector<float> nearest;
+    nearest.reserve(count);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        float best = std::numeric_limits<float>::max();
+        for (std::size_t j = 0; j < count; ++j)
+        {
+            if (i == j)
+            {
+                continue;
+            }
+            const float dx = keypoints[i].pt.x - keypoints[j].pt.x;
+            const float dy = keypoints[i].pt.y - keypoints[j].pt.y;
+            best = std::min(best, dx * dx + dy * dy);
+        }
+        nearest.push_back(std::sqrt(best));
+    }
+
+    const std::size_t mid = nearest.size() / 2;
+    std::nth_element(nearest.begin(), nearest.begin() + mid, nearest.end());
+    return nearest[mid];
+}
+
 /**
  * @brief Custom blob detector that returns pre-detected keypoints.
  *        This allows us to use findCirclesGrid with our own marker detection.
@@ -92,7 +147,7 @@ struct RowInfo
 void try_fill_missing_rows(std::map<RowIdx, RowInfo>& row_infos, const std::vector<MarkerIdx>& unindentified_indices,
                            std::vector<base::MarkerRing>& all_markers, const BoardCircleGrid& board)
 {
-    constexpr float kLineDistanceTolerance = 5.0f;
+    const float kLineDistanceTolerance = scaled_px(5.0f);
 
     // Track which unidentified markers have been assigned
     std::set<MarkerIdx> assigned_markers;
@@ -1208,6 +1263,22 @@ cv::Point2f TrackingState::predict_position(const int global_id, const int curre
 
 // --- Hungarian Algorithm (Jonker-Volgenant) ---
 
+void circlegrid::set_resolution_scale(const int width, const int height)
+{
+    if (width <= 0 || height <= 0)
+    {
+        g_resolution_scale = 1.0f;
+        return;
+    }
+    g_resolution_scale =
+        std::sqrt(static_cast<float>(width) * static_cast<float>(height) / kReferenceImagePixels);
+}
+
+float circlegrid::resolution_scale()
+{
+    return g_resolution_scale;
+}
+
 std::vector<int> circlegrid::hungarian_assignment(const std::vector<std::vector<float>>& cost_matrix, float max_cost)
 {
     if (cost_matrix.empty())
@@ -1739,7 +1810,7 @@ void circlegrid::identify_unmatched_by_local_homography(std::vector<base::Marker
         {
             const float dist = static_cast<float>(cv::norm(image_pts[i] - image_pts[j]));
             // Only count nearby pairs (within 2x expected spacing)
-            if (dist < 200.f)
+            if (dist < scaled_px(200.f))
             {
                 mean_spacing += dist;
                 ++spacing_count;
@@ -2088,7 +2159,7 @@ bool circlegrid::validate_tracking_with_ecc(const std::vector<base::MarkerCoding
 
 void circlegrid::identify_new_markers_by_row_lines(std::vector<base::MarkerRing>& markers, const BoardCircleGrid& board)
 {
-    constexpr float kLineDistanceThreshold = 10.0f;
+    const float kLineDistanceThreshold = scaled_px(10.0f);
 
     std::vector<MarkerIdx> unindentified_indices;
     std::map<RowIdx, RowInfo> row_infos;
@@ -2262,7 +2333,7 @@ bool populate_indices(std::vector<int>& indices, const std::vector<base::MarkerC
     indices.clear();
     // First try exact matching (same brightness scale: positions are identical).
     // Then fall back to proximity matching (different scale: positions differ slightly).
-    constexpr float kProximityThreshold = 3.0f;  // max pixels for fallback proximity match
+    const float kProximityThreshold = scaled_px(3.0f);  // max pixels for fallback proximity match
 
     for (size_t idx_marker = 0; idx_marker < coding_markers.size(); ++idx_marker)
     {
@@ -2402,18 +2473,50 @@ bool circlegrid::test_find_circles_grid(std::vector<int>& indices,
     const cv::Size pattern_size(board.cols_, board.rows_);
     const int base_flags = board.is_asymetric_ ? cv::CALIB_CB_ASYMMETRIC_GRID : cv::CALIB_CB_SYMMETRIC_GRID;
 
+    // findCirclesGrid's tuning parameters are absolute pixel distances, and the
+    // OpenCV defaults were chosen for imagery where markers sat roughly
+    // kReferenceMarkerSpacingPx apart. On this sensor they sit ~2x further
+    // apart, so a default 16x16 px density window cannot see a marker's own
+    // neighbours and grid assembly fails even though every marker was detected.
+    //
+    // Re-express the pixel fields as fractions of the *measured* spacing rather
+    // than of the image size: that tracks board distance and lens as well as
+    // resolution, and is the same basis marker::repair::thresholds_from_scale
+    // already uses. The fractions reproduce the OpenCV defaults at the
+    // reference spacing, so behaviour is unchanged on imagery it was tuned for.
+    cv::CirclesGridFinderParameters grid_params;
+    const float spacing_px = median_nearest_neighbour_distance(keypoints);
+    if (spacing_px > 0.f)
+    {
+        const float scale = spacing_px / kReferenceMarkerSpacingPx;
+        grid_params.densityNeighborhoodSize =
+            cv::Size2f(grid_params.densityNeighborhoodSize.width * scale,
+                       grid_params.densityNeighborhoodSize.height * scale);
+        grid_params.minDistanceToAddKeypoint =
+            std::max(1, static_cast<int>(std::lround(grid_params.minDistanceToAddKeypoint * scale)));
+        grid_params.minRNGEdgeSwitchDist *= scale;
+        spdlog::debug("findCirclesGrid scaling: spacing {:.1f}px -> scale {:.2f} "
+                      "(density {:.1f}px, minDistAdd {}px, rngSwitch {:.1f}px)",
+                      spacing_px, scale, grid_params.densityNeighborhoodSize.width,
+                      grid_params.minDistanceToAddKeypoint, grid_params.minRNGEdgeSwitchDist);
+    }
+
     std::vector<cv::Point2f> centers;
     bool found = false;
 
     // Try clustering first, then non-clustering
     {
         cv::Ptr<cv::Feature2D> blob_detector = cv::makePtr<PredetectedBlobDetector>(keypoints);
-        found = cv::findCirclesGrid(dummy_image, pattern_size, centers, base_flags | cv::CALIB_CB_CLUSTERING, blob_detector);
+        grid_params.gridType = board.is_asymetric_ ? cv::CirclesGridFinderParameters::ASYMMETRIC_GRID
+                                                   : cv::CirclesGridFinderParameters::SYMMETRIC_GRID;
+        found = cv::findCirclesGrid(dummy_image, pattern_size, centers,
+                                    base_flags | cv::CALIB_CB_CLUSTERING, blob_detector, grid_params);
     }
     if (!found)
     {
         cv::Ptr<cv::Feature2D> blob_detector = cv::makePtr<PredetectedBlobDetector>(keypoints);
-        found = cv::findCirclesGrid(dummy_image, pattern_size, centers, base_flags, blob_detector);
+        found = cv::findCirclesGrid(dummy_image, pattern_size, centers, base_flags,
+                                    blob_detector, grid_params);
     }
 
     if (!found || static_cast<int>(centers.size()) != total)
@@ -2546,7 +2649,7 @@ bool circlegrid::test_find_circles_grid(std::vector<int>& indices,
                 if (it == tracker_state.tracks_.end()) continue;
                 const float dist = static_cast<float>(cv::norm(
                     cv::Point2f(coding_markers[i].col_, coding_markers[i].row_) - it->second.last_position));
-                if (dist < 80.f) ++matches;  // within reasonable inter-frame motion
+                if (dist < scaled_px(80.f)) ++matches;  // within reasonable inter-frame motion
             }
             return matches;
         };

@@ -616,6 +616,14 @@ base::ImageDecoding detection::detect_and_identify_circlegrid(
 {
     spdlog::info("Detecting circle grid markers in image {}", image_idx);
 
+    // Adapt the identifier's absolute pixel tolerances to this image size. They
+    // were tuned at 800x600; on a larger sensor the same physical displacement
+    // spans proportionally more pixels, so an unscaled budget silently rejects
+    // markers that belong to their row. Set here rather than at the call sites
+    // so every entry point -- live detection and dropped-frame repair alike --
+    // gets a consistent scale.
+    identification::circlegrid::set_resolution_scale(input.cols, input.rows);
+
     // Use output_path if provided, otherwise keep default
     if (!output_path.empty())
         pth = output_path.string();

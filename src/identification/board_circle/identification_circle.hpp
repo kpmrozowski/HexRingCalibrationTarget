@@ -162,6 +162,23 @@ std::optional<std::vector<int>> identify_with_tracking(const std::vector<base::M
                                                        const std::vector<int>& prev_ids, float distance_threshold,
                                                        float ransac_threshold);
 
+/// Set the resolution scale used to adapt the absolute pixel tolerances in this
+/// module. Those tolerances were tuned against 800x600 imagery; on a larger
+/// sensor every pixel distance in the image grows with it, so a fixed pixel
+/// budget is effectively tighter and grid assembly rejects markers it should
+/// accept. Scale is sqrt(width * height / (800 * 600)) -- an area ratio, so it
+/// tracks the linear growth of distances regardless of aspect ratio.
+///
+/// Call once per image before identification. Not thread safe: the value is
+/// per-process state, which suits the fork-based worker pool (each worker has
+/// its own copy) but would need revisiting if identification is ever threaded
+/// within a process.
+void set_resolution_scale(int width, int height);
+
+/// Current scale; 1.0 until set_resolution_scale() is called, so behaviour is
+/// unchanged for any caller that does not set it.
+float resolution_scale();
+
 void identify_new_markers_by_row_lines(std::vector<base::MarkerRing>& markers, const BoardCircleGrid& board);
 
 bool test_find_circles_grid(std::vector<int>& indices, const std::vector<base::MarkerCoding>& coding_markers,
