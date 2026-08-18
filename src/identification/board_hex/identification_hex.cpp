@@ -297,15 +297,33 @@ identification::OrderingBoardHex create_ordering(const std::vector<int> &markers
     ordering_set.ordering_ =
         Eigen::Matrix<std::optional<int>, -1, -1>::Constant(board.rows_, board.cols_, std::nullopt);
     ordering_set.coordinate_grid_defined_ = Eigen::Matrix<bool, -1, -1>::Constant(board.rows_, board.cols_, false);
+    int rejected = 0;
     for (int idx = 0; idx < int(markers_order.size()); ++idx)
     {
         if (markers_order[idx] == -1)
         {
             continue;
         }
-        Eigen::Vector2i rowcol = board.id_to_row_and_col(markers_order[idx]);
+        // id_to_row_and_col is unchecked integer arithmetic (id / cols_), so an
+        // id outside the board yields an out-of-range row/col. Eigen does not
+        // range-check in release builds, so writing it corrupts the heap: the
+        // process then dies later at an unrelated allocation, which is how this
+        // surfaced -- a segfault inside the detector under a worker pool, and a
+        // std::bad_alloc (MemoryError through the Python binding) when run
+        // single-threaded. Reject the id here instead.
+        const Eigen::Vector2i rowcol = board.id_to_row_and_col(markers_order[idx]);
+        if (rowcol(0) < 0 || rowcol(0) >= board.rows_ || rowcol(1) < 0 || rowcol(1) >= board.cols_)
+        {
+            ++rejected;
+            continue;
+        }
         ordering_set.ordering_(rowcol(0), rowcol(1)) = idx;
         ordering_set.coordinate_grid_defined_(rowcol(0), rowcol(1)) = true;
+    }
+    if (rejected > 0)
+    {
+        spdlog::warn("create_ordering: dropped {} marker(s) whose global id falls outside the {}x{} board",
+                     rejected, board.rows_, board.cols_);
     }
     return ordering_set;
 }
