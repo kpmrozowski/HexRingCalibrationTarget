@@ -1,5 +1,8 @@
 #include "thresholds.hpp"
 
+#include <algorithm>
+#include <utility>
+
 #include <opencv2/imgproc.hpp>
 
 #include <io/debug.hpp>
@@ -9,7 +12,29 @@
 namespace
 {
 static constexpr std::string_view kThresholdsSubdir = "thresholds";
+
+/// \brief Half-open [start, end) bounds of one tile along one axis.
+///
+/// The last tile takes the remainder. `size / tiles` truncates, so tiles laid
+/// out at that pitch stop short of the image whenever the two do not divide
+/// evenly: 640 columns over 14 tiles covers 630 and leaves 10, 800 over 14
+/// covers 798 and leaves 2.
+///
+/// In `binarize` that mattered, because its output is a `cv::Mat1b` allocated
+/// but not initialised: the leftover columns were never written, and the blob
+/// filter downstream read whatever `malloc` had left there. Detection results
+/// then varied from run to run on the same frames -- 2.5% of frames on a
+/// 640-wide thermal recording came out with a different marker-id set, while
+/// the marker coordinates that did agree were bit-identical, which is the
+/// signature of garbage pixels forming or destroying a blob at the edge.
+std::pair<int, int> tile_bounds(const int index, const int tiles, const int size)
+{
+    const int step = size / tiles;
+    const int start = std::min(index * step, size);
+    const int end = (index + 1 == tiles) ? size : std::min(start + step, size);
+    return {start, end};
 }
+}  // namespace
 
 namespace debug
 {
@@ -129,17 +154,12 @@ thresholds::TiledThresholds thresholds::thresholds(const cv::Mat1b &image, const
 {
     thresholds::TiledThresholds tiled_thresholds(tiles_row, tiles_col);
 
-    const int row_step = image.rows / tiles_row;
-    const int col_step = image.cols / tiles_col;
-
     for (int row_tile = 0; row_tile < tiles_row; ++row_tile)
     {
-        const int start_row = row_tile * row_step;
-        const int end_row = std::min(start_row + row_step, image.rows);
+        const auto [start_row, end_row] = tile_bounds(row_tile, tiles_row, image.rows);
         for (int col_tile = 0; col_tile < tiles_col; ++col_tile)
         {
-            const int start_col = col_tile * col_step;
-            const int end_col = std::min(start_col + col_step, image.cols);
+            const auto [start_col, end_col] = tile_bounds(col_tile, tiles_col, image.cols);
 
             tiled_thresholds.thresholds_[row_tile * tiles_col + col_tile] =
                 thresholds_in_tile(start_row, end_row, start_col, end_col, image);
@@ -152,17 +172,12 @@ cv::Mat1b thresholds::binarize(const cv::Mat1b &image, const TiledThresholds &tr
 {
     cv::Mat1b binarized(image.rows, image.cols);
 
-    const int row_step = image.rows / tresholds.tiles_row_;
-    const int col_step = image.cols / tresholds.tiles_col_;
-
     for (int row_tile = 0; row_tile < tresholds.tiles_row_; ++row_tile)
     {
-        const int start_row = row_tile * row_step;
-        const int end_row = std::min(start_row + row_step, image.rows);
+        const auto [start_row, end_row] = tile_bounds(row_tile, tresholds.tiles_row_, image.rows);
         for (int col_tile = 0; col_tile < tresholds.tiles_col_; ++col_tile)
         {
-            const int start_col = col_tile * col_step;
-            const int end_col = std::min(start_col + col_step, image.cols);
+            const auto [start_col, end_col] = tile_bounds(col_tile, tresholds.tiles_col_, image.cols);
 
             const int tresh_to_use = tresholds.thresholds_[row_tile * tresholds.tiles_col_ + col_tile];
 
