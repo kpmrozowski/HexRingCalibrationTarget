@@ -44,22 +44,24 @@ void paint_tresholds(const cv::Mat1b &image, const std::vector<int> &tresholds, 
     cv::Mat3b painted;
     cv::cvtColor(image, painted, cv::COLOR_GRAY2BGR);
 
-    const int row_step = image.rows / tiles_row;
-    const int col_step = image.cols / tiles_col;
-
+    // Same bounds the thresholds were computed over, so the drawn grid is the
+    // grid: with the last tile taking the remainder, a fixed step would draw
+    // rectangles that stop short of the image and misreport which pixels a
+    // threshold covers.
     for (int row_tile = 0; row_tile < tiles_row; ++row_tile)
     {
-        const int start_row = row_tile * row_step;
-        const int middle_row = row_tile * row_step + row_step / 2;
+        const auto [start_row, end_row] = tile_bounds(row_tile, tiles_row, image.rows);
+        const int middle_row = (start_row + end_row) / 2;
 
         for (int col_tile = 0; col_tile < tiles_col; ++col_tile)
         {
-            const int start_col = col_tile * col_step;
-            const int middle_col = col_tile * col_step + col_step / 2;
+            const auto [start_col, end_col] = tile_bounds(col_tile, tiles_col, image.cols);
+            const int middle_col = (start_col + end_col) / 2;
 
             const int tresh_to_use = tresholds[row_tile * tiles_col + col_tile];
 
-            cv::rectangle(painted, cv::Rect2i(start_col, start_row, col_step, row_step), cv::Scalar(0, 255, 0), 1);
+            cv::rectangle(painted, cv::Rect2i(start_col, start_row, end_col - start_col, end_row - start_row),
+                          cv::Scalar(0, 255, 0), 1);
 
             cv::putText(painted, std::to_string(tresh_to_use), cv::Point(middle_col, middle_row),
                         cv::FONT_HERSHEY_COMPLEX, 0.3, cv::Scalar(0, 255, 0));
